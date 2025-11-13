@@ -2,6 +2,7 @@ mod config;
 mod connection;
 mod model;
 mod sync;
+mod task_queue;
 mod view;
 
 use gpui::*;

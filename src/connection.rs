@@ -12,6 +12,11 @@ const DEFAULT_SSH_PORT: u16 = 22;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 
 pub fn test_connection(target: &RemoteTarget) -> Result<()> {
+    let _ = establish_session(target)?;
+    Ok(())
+}
+
+pub fn establish_session(target: &RemoteTarget) -> Result<Session> {
     let (host, port) = split_host_port(&target.host);
     let addr = format!("{host}:{port}");
     let socket_addr = resolve_addr(&addr)?.ok_or_else(|| anyhow!("unable to resolve {host}"))?;
@@ -38,7 +43,7 @@ pub fn test_connection(target: &RemoteTarget) -> Result<()> {
         return Err(anyhow!("authentication rejected"));
     }
 
-    Ok(())
+    Ok(session)
 }
 
 fn resolve_addr(addr: &str) -> Result<Option<std::net::SocketAddr>> {

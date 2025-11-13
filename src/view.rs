@@ -7,9 +7,10 @@ use crate::{
     config::save_state,
     connection,
     model::{
-        ActiveView, AppSettings, AppState, ConnectionTestState, Language, RemoteTarget,
+        ActiveView, AppSettings, AppState, ConnectionTestState, Language, LogLevel, RemoteTarget,
         SyncDirection, SyncRule, SyncSession, SyncStatus, TargetFormMode, TargetId,
     },
+    task_queue,
 };
 use anyhow::Error;
 use gpui::{
@@ -426,7 +427,9 @@ impl Render for AppView {
                                     connection_tests.get(&target.id),
                                     language,
                                 ))
-                                .child(
+                                .child({
+                                    let plan_handle = self.state.clone();
+                                    let plan_target = target.clone();
                                     Button::new("plan_sync")
                                         .primary()
                                         .label(tr(
@@ -436,17 +439,279 @@ impl Render for AppView {
                                             "產生試運行計畫",
                                         ))
                                         .icon(Icon::new(IconName::LayoutDashboard).small())
-                                        .on_click(|_, _, _| {
-                                            println!("TODO: trigger dry run planning")
-                                        }),
-                                )
-                                .child(
+                                        .on_click(move |_, _, cx| {
+                                            {
+                                                let handle = plan_handle.clone();
+                                                let target_name = plan_target.name.clone();
+                                                handle.update(cx, |state, cx| {
+                                                    for session in state.sessions.iter_mut().filter(
+                                                        |session| session.target_id == plan_target.id,
+                                                    ) {
+                                                        session.status = SyncStatus::Planning;
+                                                        session.last_run = Some(SystemTime::now());
+                                                    }
+                                                    state.log_event(
+                                                        LogLevel::Info,
+                                                        format!("Planning sync for {target_name}"),
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+
+                                            let async_handle = plan_handle.clone();
+                                            cx.spawn({
+                                                let snapshot = plan_target.clone();
+                                                async move |cx| {
+                                                    let target_name = snapshot.name.clone();
+                                                    let receiver = task_queue::submit_plan(snapshot.clone());
+                                                    match receiver.recv().await {
+                                                        Ok(Ok(result)) => {
+                                                            let pending: usize = result
+                                                                .jobs
+                                                                .iter()
+                                                                .map(|job| job.actions.len())
+                                                                .sum();
+                                                            let _ = async_handle.update(cx, |state, cx| {
+                                                                state.apply_planned_jobs(
+                                                                    snapshot.id,
+                                                                    result,
+                                                                );
+                                                                state.log_event(
+                                                                    LogLevel::Info,
+                                                                    format!(
+                                                                        "Dry run ready for {target_name} ({pending} actions)"
+                                                                    ),
+                                                                );
+                                                                cx.notify();
+                                                            });
+                                                        }
+                                                        Ok(Err(err)) => {
+                                                            let _ = async_handle.update(cx, |state, cx| {
+                                                                state.log_event(
+                                                                    LogLevel::Error,
+                                                                    format!(
+                                                                        "Planning failed for {target_name}: {err}"
+                                                                    ),
+                                                                );
+                                                                cx.notify();
+                                                            });
+                                                        }
+                                                        Err(recv_err) => {
+                                                            let _ = async_handle.update(cx, |state, cx| {
+                                                                state.log_event(
+                                                                    LogLevel::Error,
+                                                                    format!(
+                                                                        "Planning failed for {target_name}: {recv_err}"
+                                                                    ),
+                                                                );
+                                                                cx.notify();
+                                                            });
+                                                        }
+                                                    }
+                                                    Ok::<_, Error>(())
+                                                }
+                                            })
+                                            .detach();
+                                        })
+                                })
+                                .child({
+                                    let execute_handle = self.state.clone();
+                                    let execute_target = target.clone();
                                     Button::new("sync_now")
                                         .success()
                                         .label(tr(language, "Execute Sync", "执行同步", "執行同步"))
                                         .icon(Icon::new(IconName::Check).small())
-                                        .on_click(|_, _, _| println!("TODO: execute sync")),
-                                )
+                                        .on_click(move |_, _, cx| {
+                                            let maybe_snapshot = execute_handle.update(cx, |state, cx| {
+                                                let jobs: Vec<_> = state
+                                                    .jobs
+                                                    .iter()
+                                                    .filter(|job| job.target_id == execute_target.id)
+                                                    .cloned()
+                                                    .collect();
+                                                if jobs.is_empty() {
+                                                    state.log_event(
+                                                        LogLevel::Info,
+                                                        format!(
+                                                            "Nothing to sync for {}",
+                                                            execute_target.name
+                                                        ),
+                                                    );
+                                                    cx.notify();
+                                                    return None;
+                                                }
+
+                                                for session in state
+                                                    .sessions
+                                                    .iter_mut()
+                                                    .filter(|session| session.target_id == execute_target.id)
+                                                {
+                                                    session.status = SyncStatus::Running { progress: 0.0 };
+                                                    session.last_run = Some(SystemTime::now());
+                                                }
+                                                state.log_event(
+                                                    LogLevel::Info,
+                                                    format!("Executing sync for {}", execute_target.name),
+                                                );
+                                                cx.notify();
+                                                Some(jobs)
+                                            });
+
+                                            if let Some(job_snapshot) = maybe_snapshot {
+                                                let exec_receiver =
+                                                    task_queue::submit_execute(execute_target.clone(), job_snapshot);
+                                                let handle = execute_handle.clone();
+                                                cx.spawn({
+                                                    let target_snapshot = execute_target.clone();
+                                                    async move |cx| {
+                                                        match exec_receiver.recv().await {
+                                                            Ok(Ok(summary)) => {
+                                                                let _ = handle.update(cx, |state, cx| {
+                                                                    if summary.failures.is_empty() {
+                                                                        state.log_event(
+                                                                            LogLevel::Info,
+                                                                            format!(
+                                                                                "Sync completed for {} ({} actions, {} conflicts)",
+                                                                                target_snapshot.name,
+                                                                                summary.applied,
+                                                                                summary.skipped
+                                                                            ),
+                                                                        );
+                                                                        for session in state
+                                                                            .sessions
+                                                                            .iter_mut()
+                                                                            .filter(|session| session.target_id == target_snapshot.id)
+                                                                        {
+                                                                            session.status = SyncStatus::Completed;
+                                                                            session.last_run =
+                                                                                Some(SystemTime::now());
+                                                                        }
+                                                                    } else {
+                                                                        let failure_count =
+                                                                            summary.failures.len();
+                                                                        let first_error = summary
+                                                                            .failures
+                                                                            .first()
+                                                                            .map(|(_, reason)| reason.clone())
+                                                                            .unwrap_or_else(|| "Unknown failure".into());
+                                                                        state.log_event(
+                                                                            LogLevel::Error,
+                                                                            format!(
+                                                                                "Sync finished with {failure_count} failures for {}: {first_error}",
+                                                                                target_snapshot.name
+                                                                            ),
+                                                                        );
+                                                                        for session in state
+                                                                            .sessions
+                                                                            .iter_mut()
+                                                                            .filter(|session| session.target_id == target_snapshot.id)
+                                                                        {
+                                                                            session.status = SyncStatus::Failed {
+                                                                                reason: first_error.clone(),
+                                                                            };
+                                                                            session.last_run =
+                                                                                Some(SystemTime::now());
+                                                                        }
+                                                                    }
+                                                                    cx.notify();
+                                                                });
+
+                                                                let follow_receiver =
+                                                                    task_queue::submit_plan(target_snapshot.clone());
+                                                                match follow_receiver.recv().await {
+                                                                    Ok(Ok(plan)) => {
+                                                                        let _ = handle.update(cx, |state, cx| {
+                                                                            state.apply_planned_jobs(
+                                                                                target_snapshot.id,
+                                                                                plan,
+                                                                            );
+                                                                            cx.notify();
+                                                                        });
+                                                                    }
+                                                                    Ok(Err(err)) => {
+                                                                        let _ = handle.update(cx, |state, cx| {
+                                                                            state.log_event(
+                                                                                LogLevel::Warn,
+                                                                                format!(
+                                                                                    "Failed to refresh plan after sync for {}: {err}",
+                                                                                    target_snapshot.name
+                                                                                ),
+                                                                            );
+                                                                            cx.notify();
+                                                                        });
+                                                                    }
+                                                                    Err(recv_err) => {
+                                                                        let _ = handle.update(cx, |state, cx| {
+                                                                            state.log_event(
+                                                                                LogLevel::Warn,
+                                                                                format!(
+                                                                                    "Failed to refresh plan after sync for {}: {recv_err}",
+                                                                                    target_snapshot.name
+                                                                                ),
+                                                                            );
+                                                                            cx.notify();
+                                                                        });
+                                                                    }
+                                                                }
+                                                            }
+                                                            Ok(Err(err)) => {
+                                                                let message = err.to_string();
+                                                                let _ = handle.update(cx, |state, cx| {
+                                                                    state.log_event(
+                                                                        LogLevel::Error,
+                                                                        format!(
+                                                                            "Sync failed for {}: {}",
+                                                                            target_snapshot.name, message
+                                                                        ),
+                                                                    );
+                                                                    for session in state
+                                                                        .sessions
+                                                                        .iter_mut()
+                                                                        .filter(|session| session.target_id == target_snapshot.id)
+                                                                    {
+                                                                        session.status = SyncStatus::Failed {
+                                                                            reason: message.clone(),
+                                                                        };
+                                                                        session.last_run =
+                                                                            Some(SystemTime::now());
+                                                                    }
+                                                                    cx.notify();
+                                                                });
+                                                            }
+                                                            Err(recv_err) => {
+                                                                let message =
+                                                                    format!("task cancelled: {recv_err}");
+                                                                let _ = handle.update(cx, |state, cx| {
+                                                                    state.log_event(
+                                                                        LogLevel::Error,
+                                                                        format!(
+                                                                            "Sync failed for {}: {}",
+                                                                            target_snapshot.name, message
+                                                                        ),
+                                                                    );
+                                                                    for session in state
+                                                                        .sessions
+                                                                        .iter_mut()
+                                                                        .filter(|session| session.target_id == target_snapshot.id)
+                                                                    {
+                                                                        session.status = SyncStatus::Failed {
+                                                                            reason: message.clone(),
+                                                                        };
+                                                                        session.last_run =
+                                                                            Some(SystemTime::now());
+                                                                    }
+                                                                    cx.notify();
+                                                                });
+                                                            }
+                                                        }
+
+                                                        Ok::<_, Error>(())
+                                                    }
+                                                })
+                                                .detach();
+                                            }
+                                        })
+                                })
                                 .child(
                                     Button::new("edit_target")
                                         .ghost()
@@ -527,6 +792,7 @@ impl Render for AppView {
                                                                 handle.update(cx, |state, cx| {
                                                                     state.remote_targets.retain(|t| t.id != target_id);
                                                                     state.connection_tests.remove(&target_id);
+                                                                    state.drop_jobs_for_target(target_id);
                                                                     if state.active_target == Some(target_id) {
                                                                         state.active_target = state
                                                                             .remote_targets
@@ -606,6 +872,20 @@ impl Render for AppView {
                 .rev()
                 .take(6)
                 .fold(div().v_flex().gap_2(), |builder, log| {
+                    let icon_color = match log.level {
+                        LogLevel::Info => cx.theme().info,
+                        LogLevel::Warn => cx.theme().warning,
+                        LogLevel::Error => cx.theme().danger,
+                    };
+                    let level_tag = match log.level {
+                        LogLevel::Info => Tag::info(),
+                        LogLevel::Warn => Tag::warning(),
+                        LogLevel::Error => Tag::danger(),
+                    }
+                    .small()
+                    .rounded_full()
+                    .child(log.level.as_str());
+
                     builder.child(
                         div()
                             .h_flex()
@@ -618,10 +898,11 @@ impl Render for AppView {
                                     .gap_2()
                                     .items_center()
                                     .child(
-                                        Icon::new(log_icon(&log.message))
+                                        Icon::new(log_icon(log.level))
                                             .small()
-                                            .text_color(cx.theme().muted_foreground),
+                                            .text_color(icon_color),
                                     )
+                                    .child(level_tag)
                                     .child(log.message.clone()),
                             )
                             .child(
@@ -813,13 +1094,11 @@ fn render_target_form_panel(
         })
         .on_click(move |_, _, cx| match mode {
             TargetFormMode::Create => {
-                let next_id = {
-                    let state = submit_handle.read(cx);
-                    state.next_target_id()
-                };
+                let next_id = submit_handle.read(cx).next_target_id();
                 if let Some(new_target) =
                     form_handle.update(cx, |form, cx| form.build_target(next_id, cx))
                 {
+                    let plan_target = new_target.clone();
                     submit_handle.update(cx, |state, cx| {
                         state.remote_targets.push(new_target);
                         state.active_target = state.remote_targets.last().map(|target| target.id);
@@ -828,12 +1107,65 @@ fn render_target_form_panel(
                         save_state(&state.settings, &state.remote_targets);
                         cx.notify();
                     });
+                    let async_handle = submit_handle.clone();
+                    cx.spawn({
+                        let plan_target = plan_target.clone();
+                        async move |cx| {
+                            let target_name = plan_target.name.clone();
+                            let receiver = task_queue::submit_plan(plan_target.clone());
+                            match receiver.recv().await {
+                                Ok(Ok(result)) => {
+                                    let _ = async_handle.update(cx, |state, cx| {
+                                        state.apply_planned_jobs(plan_target.id, result);
+                                        let pending: usize = state
+                                            .jobs
+                                            .iter()
+                                            .filter(|job| job.target_id == plan_target.id)
+                                            .map(|job| job.pending_actions())
+                                            .sum();
+                                        state.log_event(
+                                            LogLevel::Info,
+                                            format!(
+                                                "Sync plan ready for {target_name} ({pending} actions)"
+                                            ),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                                Ok(Err(err)) => {
+                                    let _ = async_handle.update(cx, |state, cx| {
+                                        state.log_event(
+                                            LogLevel::Error,
+                                            format!(
+                                                "Failed to prepare sync plan for {target_name}: {err}"
+                                            ),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                                Err(recv_err) => {
+                                    let _ = async_handle.update(cx, |state, cx| {
+                                        state.log_event(
+                                            LogLevel::Error,
+                                            format!(
+                                                "Failed to prepare sync plan for {target_name}: {recv_err}"
+                                            ),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                            Ok::<_, Error>(())
+                        }
+                    })
+                    .detach();
                 }
             }
             TargetFormMode::Edit(target_id) => {
                 if let Some(updated) =
                     form_handle.update(cx, |form, cx| form.build_target(target_id, cx))
                 {
+                    let plan_target = updated.clone();
                     submit_handle.update(cx, |state, cx| {
                         if let Some(existing) = state
                             .remote_targets
@@ -847,6 +1179,59 @@ fn render_target_form_panel(
                         state.active_view = ActiveView::Dashboard;
                         cx.notify();
                     });
+
+                    let async_handle = submit_handle.clone();
+                    cx.spawn({
+                        let plan_target = plan_target.clone();
+                        async move |cx| {
+                            let target_name = plan_target.name.clone();
+                            let receiver = task_queue::submit_plan(plan_target.clone());
+                            match receiver.recv().await {
+                                Ok(Ok(result)) => {
+                                    let _ = async_handle.update(cx, |state, cx| {
+                                        state.apply_planned_jobs(plan_target.id, result);
+                                        let pending: usize = state
+                                            .jobs
+                                            .iter()
+                                            .filter(|job| job.target_id == plan_target.id)
+                                            .map(|job| job.pending_actions())
+                                            .sum();
+                                        state.log_event(
+                                            LogLevel::Info,
+                                            format!(
+                                                "Sync plan ready for {target_name} ({pending} actions)"
+                                            ),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                                Ok(Err(err)) => {
+                                    let _ = async_handle.update(cx, |state, cx| {
+                                        state.log_event(
+                                            LogLevel::Error,
+                                            format!(
+                                                "Failed to refresh sync plan for {target_name}: {err}"
+                                            ),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                                Err(recv_err) => {
+                                    let _ = async_handle.update(cx, |state, cx| {
+                                        state.log_event(
+                                            LogLevel::Error,
+                                            format!(
+                                                "Failed to refresh sync plan for {target_name}: {recv_err}"
+                                            ),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                            Ok::<_, Error>(())
+                        }
+                    })
+                    .detach();
                 }
             }
         });
@@ -1306,14 +1691,11 @@ fn status_tag(status: &SyncStatus) -> Tag {
     .rounded_full()
 }
 
-fn log_icon(message: &str) -> IconName {
-    let lowercase = message.to_ascii_lowercase();
-    if lowercase.contains("fail") || lowercase.contains("error") {
-        IconName::TriangleAlert
-    } else if lowercase.contains("stage") || lowercase.contains("detect") {
-        IconName::LayoutDashboard
-    } else {
-        IconName::CircleCheck
+fn log_icon(level: LogLevel) -> IconName {
+    match level {
+        LogLevel::Info => IconName::Info,
+        LogLevel::Warn => IconName::TriangleAlert,
+        LogLevel::Error => IconName::CircleX,
     }
 }
 
