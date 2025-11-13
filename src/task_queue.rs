@@ -8,12 +8,18 @@ use once_cell::sync::Lazy;
 use crate::{
     model::RemoteTarget,
     sync::{
-        execute_jobs_for_target, plan_jobs_for_target, ExecutionSummary, PlanJobsResult, SyncJob,
+        execute_jobs_with_progress, plan_jobs_with_progress, ExecutionSummary, PlanJobsResult,
+        SyncJob,
     },
 };
 
-type PlanResponder = AsyncSender<Result<PlanJobsResult>>;
-type ExecuteResponder = AsyncSender<Result<ExecutionSummary>>;
+pub enum TaskEvent<T> {
+    Progress { completed: usize, total: usize },
+    Finished(Result<T>),
+}
+
+type PlanResponder = AsyncSender<TaskEvent<PlanJobsResult>>;
+type ExecuteResponder = AsyncSender<TaskEvent<ExecutionSummary>>;
 
 enum TaskMessage {
     Plan {
@@ -52,16 +58,39 @@ fn spawn_worker(receiver: SyncReceiver<TaskMessage>, index: usize) {
             while let Ok(task) = receiver.recv() {
                 match task {
                     TaskMessage::Plan { target, respond_to } => {
-                        let result = plan_jobs_for_target(&target);
-                        let _ = respond_to.send_blocking(result);
+                        let rules_total = target.rules.len().max(1);
+                        let _ = respond_to.send_blocking(TaskEvent::Progress {
+                            completed: 0,
+                            total: rules_total,
+                        });
+                        let result = plan_jobs_with_progress(&target, |completed, total| {
+                            let total = total.max(1);
+                            let _ = respond_to.send_blocking(TaskEvent::Progress {
+                                completed: completed.min(total),
+                                total,
+                            });
+                        });
+                        let _ = respond_to.send_blocking(TaskEvent::Finished(result));
                     }
                     TaskMessage::Execute {
                         target,
                         jobs,
                         respond_to,
                     } => {
-                        let result = execute_jobs_for_target(&target, &jobs);
-                        let _ = respond_to.send_blocking(result);
+                        let total_actions: usize =
+                            jobs.iter().map(|job| job.plan.actions.len()).sum::<usize>().max(1);
+                        let _ = respond_to.send_blocking(TaskEvent::Progress {
+                            completed: 0,
+                            total: total_actions,
+                        });
+                        let result = execute_jobs_with_progress(&target, &jobs, |completed, total| {
+                            let total = total.max(1);
+                            let _ = respond_to.send_blocking(TaskEvent::Progress {
+                                completed: completed.min(total),
+                                total,
+                            });
+                        });
+                        let _ = respond_to.send_blocking(TaskEvent::Finished(result));
                     }
                 }
             }
@@ -76,8 +105,8 @@ static TASK_QUEUE: Lazy<TaskQueue> = Lazy::new(|| {
     TaskQueue::new(workers)
 });
 
-pub fn submit_plan(target: RemoteTarget) -> AsyncReceiver<Result<PlanJobsResult>> {
-    let (tx, rx) = bounded(1);
+pub fn submit_plan(target: RemoteTarget) -> AsyncReceiver<TaskEvent<PlanJobsResult>> {
+    let (tx, rx) = bounded(16);
     TASK_QUEUE.submit(TaskMessage::Plan {
         target,
         respond_to: tx,
@@ -88,8 +117,8 @@ pub fn submit_plan(target: RemoteTarget) -> AsyncReceiver<Result<PlanJobsResult>
 pub fn submit_execute(
     target: RemoteTarget,
     jobs: Vec<SyncJob>,
-) -> AsyncReceiver<Result<ExecutionSummary>> {
-    let (tx, rx) = bounded(1);
+) -> AsyncReceiver<TaskEvent<ExecutionSummary>> {
+    let (tx, rx) = bounded(16);
     TASK_QUEUE.submit(TaskMessage::Execute {
         target,
         jobs,

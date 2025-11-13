@@ -91,6 +91,34 @@ impl LogLevel {
     }
 }
 
+#[derive(Clone)]
+pub struct TaskProgress {
+    pub kind: TaskKind,
+    pub completed: usize,
+    pub total: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Planning,
+    Executing,
+}
+
+impl TaskProgress {
+    pub fn new(kind: TaskKind, completed: usize, total: usize) -> Self {
+        Self {
+            kind,
+            completed,
+            total: total.max(1),
+        }
+    }
+
+    pub fn percent(&self) -> f32 {
+        let total = self.total.max(1) as f32;
+        (self.completed as f32 / total).clamp(0.0, 1.0) * 100.0
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     English,
@@ -139,6 +167,7 @@ pub struct AppState {
     pub connection_tests: HashMap<TargetId, ConnectionTestState>,
     pub jobs: Vec<SyncJob>,
     next_session_id: SessionId,
+    pub task_progress: HashMap<TargetId, TaskProgress>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -190,6 +219,7 @@ impl AppState {
             connection_tests: HashMap::new(),
             jobs: Vec::new(),
             next_session_id: 1,
+            task_progress: HashMap::new(),
         };
 
         for target in state.remote_targets.clone() {
@@ -248,8 +278,17 @@ impl AppState {
         self.refresh_sessions();
     }
 
+    pub fn set_task_progress(&mut self, target_id: TargetId, progress: TaskProgress) {
+        self.task_progress.insert(target_id, progress);
+    }
+
+    pub fn clear_task_progress(&mut self, target_id: TargetId) {
+        self.task_progress.remove(&target_id);
+    }
+
     pub fn drop_jobs_for_target(&mut self, target_id: TargetId) {
         self.jobs.retain(|job| job.target_id != target_id);
+        self.task_progress.remove(&target_id);
         self.refresh_sessions();
     }
 

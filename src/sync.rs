@@ -329,13 +329,23 @@ fn index_entries(entries: Vec<FileEntry>) -> FileIndex {
 }
 
 pub fn plan_jobs_for_target(target: &RemoteTarget) -> Result<PlanJobsResult> {
+    plan_jobs_with_progress(target, |_completed, _total| {})
+}
+
+pub fn plan_jobs_with_progress(
+    target: &RemoteTarget,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<PlanJobsResult> {
     let remote_store = SftpRemoteStore::connect(target)?;
     let local_store = FsLocalStore::default();
+
+    let total_rules = target.rules.len().max(1);
+    progress(0, total_rules);
 
     let mut jobs = Vec::new();
     let mut warnings = Vec::new();
 
-    for rule in &target.rules {
+    for (index, rule) in target.rules.iter().enumerate() {
         match plan_single_job(target.id, rule, &local_store, &remote_store) {
             Ok(job) => jobs.push(job),
             Err(err) => warnings.push(format!(
@@ -344,6 +354,7 @@ pub fn plan_jobs_for_target(target: &RemoteTarget) -> Result<PlanJobsResult> {
                 target.name
             )),
         }
+        progress(index + 1, total_rules);
     }
 
     if jobs.is_empty() {
@@ -378,7 +389,16 @@ fn plan_single_job<L: LocalStore, R: RemoteStore>(
 }
 
 pub fn execute_jobs_for_target(target: &RemoteTarget, jobs: &[SyncJob]) -> Result<ExecutionSummary> {
+    execute_jobs_with_progress(target, jobs, |_completed, _total| {})
+}
+
+pub fn execute_jobs_with_progress(
+    target: &RemoteTarget,
+    jobs: &[SyncJob],
+    mut progress: impl FnMut(usize, usize),
+) -> Result<ExecutionSummary> {
     if jobs.is_empty() {
+        progress(1, 1);
         return Ok(ExecutionSummary::default());
     }
 
@@ -387,16 +407,22 @@ pub fn execute_jobs_for_target(target: &RemoteTarget, jobs: &[SyncJob]) -> Resul
     let local_store = FsLocalStore::default();
     let executor = SyncExecutor::new(&local_store, &remote_store);
 
+    let total_actions: usize = jobs.iter().map(|job| job.plan.actions.len()).sum();
     let mut summary = ExecutionSummary::default();
+    let mut completed = 0;
+    progress(completed, total_actions.max(1));
+
     for job in jobs {
         for log in executor.execute(&job.plan) {
             match log.status {
                 ActionStatus::Applied => summary.applied += 1,
                 ActionStatus::SkippedConflict => summary.skipped += 1,
                 ActionStatus::Failed(reason) => {
-                    summary.failures.push((log.action, reason));
+                    summary.failures.push((log.action.clone(), reason));
                 }
             }
+            completed += 1;
+            progress(completed, total_actions.max(1));
         }
     }
 

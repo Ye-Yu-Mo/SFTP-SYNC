@@ -8,9 +8,10 @@ use crate::{
     connection,
     model::{
         ActiveView, AppSettings, AppState, ConnectionTestState, Language, LogLevel, RemoteTarget,
-        SyncDirection, SyncRule, SyncSession, SyncStatus, TargetFormMode, TargetId,
+        SyncDirection, SyncRule, SyncSession, SyncStatus, TargetFormMode, TargetId, TaskKind,
+        TaskProgress,
     },
-    task_queue,
+    task_queue::{self, TaskEvent},
 };
 use anyhow::Error;
 use gpui::{
@@ -56,6 +57,7 @@ impl Render for AppView {
             settings,
             target_form_mode,
             connection_tests,
+            task_progress_map,
         ) = {
             let state = self.state.read(cx);
             (
@@ -67,6 +69,7 @@ impl Render for AppView {
                 state.settings.clone(),
                 state.target_form,
                 state.connection_tests.clone(),
+                state.task_progress.clone(),
             )
         };
         let language = settings.language;
@@ -227,6 +230,7 @@ impl Render for AppView {
                     let edit_handle = self.state.clone();
                     let delete_handle = self.state.clone();
                     let target_id = target.id;
+                    let task_progress = task_progress_map.get(&target.id).cloned();
                     let rule_list =
                         target
                             .rules
@@ -306,6 +310,9 @@ impl Render for AppView {
                                         .child(target.summary()),
                                 ),
                         )
+                        .when_some(task_progress, |this, progress| {
+                            this.child(render_task_progress(progress, language))
+                        })
                         .child(
                             div()
                                 .h_flex()
@@ -450,6 +457,14 @@ impl Render for AppView {
                                                         session.status = SyncStatus::Planning;
                                                         session.last_run = Some(SystemTime::now());
                                                     }
+                                                    state.set_task_progress(
+                                                        plan_target.id,
+                                                        TaskProgress::new(
+                                                            TaskKind::Planning,
+                                                            0,
+                                                            plan_target.rules.len().max(1),
+                                                        ),
+                                                    );
                                                     state.log_event(
                                                         LogLevel::Info,
                                                         format!("Planning sync for {target_name}"),
@@ -464,48 +479,61 @@ impl Render for AppView {
                                                 async move |cx| {
                                                     let target_name = snapshot.name.clone();
                                                     let receiver = task_queue::submit_plan(snapshot.clone());
-                                                    match receiver.recv().await {
-                                                        Ok(Ok(result)) => {
-                                                            let pending: usize = result
-                                                                .jobs
-                                                                .iter()
-                                                                .map(|job| job.actions.len())
-                                                                .sum();
-                                                            let _ = async_handle.update(cx, |state, cx| {
-                                                                state.apply_planned_jobs(
-                                                                    snapshot.id,
-                                                                    result,
-                                                                );
-                                                                state.log_event(
-                                                                    LogLevel::Info,
-                                                                    format!(
-                                                                        "Dry run ready for {target_name} ({pending} actions)"
-                                                                    ),
-                                                                );
-                                                                cx.notify();
-                                                            });
-                                                        }
-                                                        Ok(Err(err)) => {
-                                                            let _ = async_handle.update(cx, |state, cx| {
-                                                                state.log_event(
-                                                                    LogLevel::Error,
-                                                                    format!(
-                                                                        "Planning failed for {target_name}: {err}"
-                                                                    ),
-                                                                );
-                                                                cx.notify();
-                                                            });
-                                                        }
-                                                        Err(recv_err) => {
-                                                            let _ = async_handle.update(cx, |state, cx| {
-                                                                state.log_event(
-                                                                    LogLevel::Error,
-                                                                    format!(
-                                                                        "Planning failed for {target_name}: {recv_err}"
-                                                                    ),
-                                                                );
-                                                                cx.notify();
-                                                            });
+                                                    while let Ok(event) = receiver.recv().await {
+                                                        match event {
+                                                            TaskEvent::Progress { completed, total } => {
+                                                                let _ = async_handle.update(cx, |state, cx| {
+                                                                    state.set_task_progress(
+                                                                        snapshot.id,
+                                                                        TaskProgress::new(
+                                                                            TaskKind::Planning,
+                                                                            completed,
+                                                                            total,
+                                                                        ),
+                                                                    );
+                                                                    cx.notify();
+                                                                });
+                                                            }
+                                                            TaskEvent::Finished(result) => {
+                                                                let _ = async_handle.update(cx, |state, cx| {
+                                                                    state.clear_task_progress(snapshot.id);
+                                                                    cx.notify();
+                                                                });
+                                                                match result {
+                                                                    Ok(result) => {
+                                                                        let pending: usize = result
+                                                                            .jobs
+                                                                            .iter()
+                                                                            .map(|job| job.actions.len())
+                                                                            .sum();
+                                                                        let _ = async_handle.update(cx, |state, cx| {
+                                                                            state.apply_planned_jobs(
+                                                                                snapshot.id,
+                                                                                result,
+                                                                            );
+                                                                            state.log_event(
+                                                                                LogLevel::Info,
+                                                                                format!(
+                                                                                    "Dry run ready for {target_name} ({pending} actions)"
+                                                                                ),
+                                                                            );
+                                                                            cx.notify();
+                                                                        });
+                                                                    }
+                                                                    Err(err) => {
+                                                                        let _ = async_handle.update(cx, |state, cx| {
+                                                                            state.log_event(
+                                                                                LogLevel::Error,
+                                                                                format!(
+                                                                                    "Planning failed for {target_name}: {err}"
+                                                                                ),
+                                                                            );
+                                                                            cx.notify();
+                                                                        });
+                                                                    }
+                                                                }
+                                                                break;
+                                                            }
                                                         }
                                                     }
                                                     Ok::<_, Error>(())
@@ -513,7 +541,7 @@ impl Render for AppView {
                                             })
                                             .detach();
                                         })
-                                })
+                               })
                                 .child({
                                     let execute_handle = self.state.clone();
                                     let execute_target = target.clone();
@@ -564,8 +592,23 @@ impl Render for AppView {
                                                 cx.spawn({
                                                     let target_snapshot = execute_target.clone();
                                                     async move |cx| {
-                                                        match exec_receiver.recv().await {
-                                                            Ok(Ok(summary)) => {
+                                                        loop {
+                                                            match exec_receiver.recv().await {
+                                                                Ok(TaskEvent::Progress { completed, total }) => {
+                                                                    let _ = handle.update(cx, |state, cx| {
+                                                                        state.set_task_progress(
+                                                                            target_snapshot.id,
+                                                                            TaskProgress::new(
+                                                                                TaskKind::Executing,
+                                                                                completed,
+                                                                                total,
+                                                                            ),
+                                                                        );
+                                                                        cx.notify();
+                                                                    });
+                                                                    continue;
+                                                                }
+                                                                Ok(TaskEvent::Finished(Ok(summary))) => {
                                                                 let _ = handle.update(cx, |state, cx| {
                                                                     if summary.failures.is_empty() {
                                                                         state.log_event(
@@ -618,43 +661,72 @@ impl Render for AppView {
 
                                                                 let follow_receiver =
                                                                     task_queue::submit_plan(target_snapshot.clone());
-                                                                match follow_receiver.recv().await {
-                                                                    Ok(Ok(plan)) => {
-                                                                        let _ = handle.update(cx, |state, cx| {
-                                                                            state.apply_planned_jobs(
-                                                                                target_snapshot.id,
-                                                                                plan,
-                                                                            );
-                                                                            cx.notify();
-                                                                        });
-                                                                    }
-                                                                    Ok(Err(err)) => {
-                                                                        let _ = handle.update(cx, |state, cx| {
-                                                                            state.log_event(
-                                                                                LogLevel::Warn,
-                                                                                format!(
-                                                                                    "Failed to refresh plan after sync for {}: {err}",
-                                                                                    target_snapshot.name
-                                                                                ),
-                                                                            );
-                                                                            cx.notify();
-                                                                        });
-                                                                    }
-                                                                    Err(recv_err) => {
-                                                                        let _ = handle.update(cx, |state, cx| {
-                                                                            state.log_event(
-                                                                                LogLevel::Warn,
-                                                                                format!(
-                                                                                    "Failed to refresh plan after sync for {}: {recv_err}",
-                                                                                    target_snapshot.name
-                                                                                ),
-                                                                            );
-                                                                            cx.notify();
-                                                                        });
+                                                                loop {
+                                                                    match follow_receiver.recv().await {
+                                                                        Ok(TaskEvent::Progress { completed, total }) => {
+                                                                            let _ = handle.update(cx, |state, cx| {
+                                                                                state.set_task_progress(
+                                                                                    target_snapshot.id,
+                                                                                    TaskProgress::new(
+                                                                                        TaskKind::Planning,
+                                                                                        completed,
+                                                                                        total,
+                                                                                    ),
+                                                                                );
+                                                                                cx.notify();
+                                                                            });
+                                                                            continue;
+                                                                        }
+                                                                        Ok(TaskEvent::Finished(Ok(plan))) => {
+                                                                            let _ = handle.update(cx, |state, cx| {
+                                                                                state.apply_planned_jobs(
+                                                                                    target_snapshot.id,
+                                                                                    plan,
+                                                                                );
+                                                                                state.clear_task_progress(
+                                                                                    target_snapshot.id,
+                                                                                );
+                                                                                cx.notify();
+                                                                            });
+                                                                            break;
+                                                                        }
+                                                                        Ok(TaskEvent::Finished(Err(err))) => {
+                                                                            let _ = handle.update(cx, |state, cx| {
+                                                                                state.clear_task_progress(
+                                                                                    target_snapshot.id,
+                                                                                );
+                                                                                state.log_event(
+                                                                                    LogLevel::Warn,
+                                                                                    format!(
+                                                                                        "Failed to refresh plan after sync for {}: {err}",
+                                                                                        target_snapshot.name
+                                                                                    ),
+                                                                                );
+                                                                                cx.notify();
+                                                                            });
+                                                                            break;
+                                                                        }
+                                                                        Err(recv_err) => {
+                                                                            let _ = handle.update(cx, |state, cx| {
+                                                                                state.clear_task_progress(
+                                                                                    target_snapshot.id,
+                                                                                );
+                                                                                state.log_event(
+                                                                                    LogLevel::Warn,
+                                                                                    format!(
+                                                                                        "Failed to refresh plan after sync for {}: {recv_err}",
+                                                                                        target_snapshot.name
+                                                                                    ),
+                                                                                );
+                                                                                cx.notify();
+                                                                            });
+                                                                            break;
+                                                                        }
                                                                     }
                                                                 }
+                                                                break;
                                                             }
-                                                            Ok(Err(err)) => {
+                                                            Ok(TaskEvent::Finished(Err(err))) => {
                                                                 let message = err.to_string();
                                                                 let _ = handle.update(cx, |state, cx| {
                                                                     state.log_event(
@@ -677,6 +749,7 @@ impl Render for AppView {
                                                                     }
                                                                     cx.notify();
                                                                 });
+                                                                break;
                                                             }
                                                             Err(recv_err) => {
                                                                 let message =
@@ -702,7 +775,10 @@ impl Render for AppView {
                                                                     }
                                                                     cx.notify();
                                                                 });
+                                                                break;
                                                             }
+                                                        }
+
                                                         }
 
                                                         Ok::<_, Error>(())
@@ -1104,6 +1180,14 @@ fn render_target_form_panel(
                         state.active_target = state.remote_targets.last().map(|target| target.id);
                         state.target_form = None;
                         state.active_view = ActiveView::Dashboard;
+                        state.set_task_progress(
+                            plan_target.id,
+                            TaskProgress::new(
+                                TaskKind::Planning,
+                                0,
+                                plan_target.rules.len().max(1),
+                            ),
+                        );
                         save_state(&state.settings, &state.remote_targets);
                         cx.notify();
                     });
@@ -1113,46 +1197,55 @@ fn render_target_form_panel(
                         async move |cx| {
                             let target_name = plan_target.name.clone();
                             let receiver = task_queue::submit_plan(plan_target.clone());
-                            match receiver.recv().await {
-                                Ok(Ok(result)) => {
-                                    let _ = async_handle.update(cx, |state, cx| {
-                                        state.apply_planned_jobs(plan_target.id, result);
-                                        let pending: usize = state
-                                            .jobs
-                                            .iter()
-                                            .filter(|job| job.target_id == plan_target.id)
-                                            .map(|job| job.pending_actions())
-                                            .sum();
-                                        state.log_event(
-                                            LogLevel::Info,
-                                            format!(
-                                                "Sync plan ready for {target_name} ({pending} actions)"
-                                            ),
-                                        );
-                                        cx.notify();
-                                    });
-                                }
-                                Ok(Err(err)) => {
-                                    let _ = async_handle.update(cx, |state, cx| {
-                                        state.log_event(
-                                            LogLevel::Error,
-                                            format!(
-                                                "Failed to prepare sync plan for {target_name}: {err}"
-                                            ),
-                                        );
-                                        cx.notify();
-                                    });
-                                }
-                                Err(recv_err) => {
-                                    let _ = async_handle.update(cx, |state, cx| {
-                                        state.log_event(
-                                            LogLevel::Error,
-                                            format!(
-                                                "Failed to prepare sync plan for {target_name}: {recv_err}"
-                                            ),
-                                        );
-                                        cx.notify();
-                                    });
+                            while let Ok(event) = receiver.recv().await {
+                                match event {
+                                    TaskEvent::Progress { completed, total } => {
+                                        let _ = async_handle.update(cx, |state, cx| {
+                                            state.set_task_progress(
+                                                plan_target.id,
+                                                TaskProgress::new(TaskKind::Planning, completed, total),
+                                            );
+                                            cx.notify();
+                                        });
+                                    }
+                                    TaskEvent::Finished(result) => {
+                                        let _ = async_handle.update(cx, |state, cx| {
+                                            state.clear_task_progress(plan_target.id);
+                                            cx.notify();
+                                        });
+                                        match result {
+                                            Ok(result) => {
+                                                let _ = async_handle.update(cx, |state, cx| {
+                                                    state.apply_planned_jobs(plan_target.id, result);
+                                                    let pending: usize = state
+                                                        .jobs
+                                                        .iter()
+                                                        .filter(|job| job.target_id == plan_target.id)
+                                                        .map(|job| job.pending_actions())
+                                                        .sum();
+                                                    state.log_event(
+                                                        LogLevel::Info,
+                                                        format!(
+                                                            "Sync plan ready for {target_name} ({pending} actions)"
+                                                        ),
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+                                            Err(err) => {
+                                                let _ = async_handle.update(cx, |state, cx| {
+                                                    state.log_event(
+                                                        LogLevel::Error,
+                                                        format!(
+                                                            "Failed to prepare sync plan for {target_name}: {err}"
+                                                        ),
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                             Ok::<_, Error>(())
@@ -1174,6 +1267,14 @@ fn render_target_form_panel(
                         {
                             *existing = updated;
                         }
+                        state.set_task_progress(
+                            plan_target.id,
+                            TaskProgress::new(
+                                TaskKind::Planning,
+                                0,
+                                plan_target.rules.len().max(1),
+                            ),
+                        );
                         save_state(&state.settings, &state.remote_targets);
                         state.target_form = None;
                         state.active_view = ActiveView::Dashboard;
@@ -1186,46 +1287,55 @@ fn render_target_form_panel(
                         async move |cx| {
                             let target_name = plan_target.name.clone();
                             let receiver = task_queue::submit_plan(plan_target.clone());
-                            match receiver.recv().await {
-                                Ok(Ok(result)) => {
-                                    let _ = async_handle.update(cx, |state, cx| {
-                                        state.apply_planned_jobs(plan_target.id, result);
-                                        let pending: usize = state
-                                            .jobs
-                                            .iter()
-                                            .filter(|job| job.target_id == plan_target.id)
-                                            .map(|job| job.pending_actions())
-                                            .sum();
-                                        state.log_event(
-                                            LogLevel::Info,
-                                            format!(
-                                                "Sync plan ready for {target_name} ({pending} actions)"
-                                            ),
-                                        );
-                                        cx.notify();
-                                    });
-                                }
-                                Ok(Err(err)) => {
-                                    let _ = async_handle.update(cx, |state, cx| {
-                                        state.log_event(
-                                            LogLevel::Error,
-                                            format!(
-                                                "Failed to refresh sync plan for {target_name}: {err}"
-                                            ),
-                                        );
-                                        cx.notify();
-                                    });
-                                }
-                                Err(recv_err) => {
-                                    let _ = async_handle.update(cx, |state, cx| {
-                                        state.log_event(
-                                            LogLevel::Error,
-                                            format!(
-                                                "Failed to refresh sync plan for {target_name}: {recv_err}"
-                                            ),
-                                        );
-                                        cx.notify();
-                                    });
+                            while let Ok(event) = receiver.recv().await {
+                                match event {
+                                    TaskEvent::Progress { completed, total } => {
+                                        let _ = async_handle.update(cx, |state, cx| {
+                                            state.set_task_progress(
+                                                plan_target.id,
+                                                TaskProgress::new(TaskKind::Planning, completed, total),
+                                            );
+                                            cx.notify();
+                                        });
+                                    }
+                                    TaskEvent::Finished(result) => {
+                                        let _ = async_handle.update(cx, |state, cx| {
+                                            state.clear_task_progress(plan_target.id);
+                                            cx.notify();
+                                        });
+                                        match result {
+                                            Ok(result) => {
+                                                let _ = async_handle.update(cx, |state, cx| {
+                                                    state.apply_planned_jobs(plan_target.id, result);
+                                                    let pending: usize = state
+                                                        .jobs
+                                                        .iter()
+                                                        .filter(|job| job.target_id == plan_target.id)
+                                                        .map(|job| job.pending_actions())
+                                                        .sum();
+                                                    state.log_event(
+                                                        LogLevel::Info,
+                                                        format!(
+                                                            "Sync plan ready for {target_name} ({pending} actions)"
+                                                        ),
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+                                            Err(err) => {
+                                                let _ = async_handle.update(cx, |state, cx| {
+                                                    state.log_event(
+                                                        LogLevel::Error,
+                                                        format!(
+                                                            "Failed to refresh sync plan for {target_name}: {err}"
+                                                        ),
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                             Ok::<_, Error>(())
@@ -1998,6 +2108,30 @@ fn format_timestamp(ts: SystemTime, language: Language) -> String {
         }
         Err(_) => tr(language, "in the future", "未来", "未來").into(),
     }
+}
+
+fn render_task_progress(progress: TaskProgress, language: Language) -> Div {
+    let label = match progress.kind {
+        TaskKind::Planning => tr(language, "Planning...", "规划中...", "規畫中..."),
+        TaskKind::Executing => tr(language, "Synchronizing...", "同步中...", "同步中..."),
+    };
+    let percent = progress.percent();
+
+    div()
+        .w_full()
+        .mt_2()
+        .v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .child(format!(
+                    "{} • {}/{}",
+                    label, progress.completed, progress.total
+                )),
+        )
+        .child(ProgressBar::new().value(percent))
+        .child(div().text_xs().child(format!("{percent:.0}%")))
 }
 
 fn status_text(status: &SyncStatus, language: Language) -> String {
