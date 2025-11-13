@@ -1,5 +1,7 @@
 mod config;
+mod connection;
 mod model;
+mod sync;
 mod view;
 
 use gpui::*;
@@ -15,10 +17,11 @@ fn main() {
         gpui_component::init(cx);
 
         cx.spawn(async move |cx| {
-            let initial_settings = config::load_settings();
+            let (initial_settings, initial_targets) = config::load_state();
 
             cx.open_window(WindowOptions::default(), |window, cx| {
-                let state = cx.new(|_| AppState::new(initial_settings.clone()));
+                let state =
+                    cx.new(|_| AppState::new(initial_settings.clone(), initial_targets.clone()));
                 let view = cx.new(|_| AppView::new(state.clone()));
 
                 cx.new(|cx| Root::new(view.into(), window, cx))

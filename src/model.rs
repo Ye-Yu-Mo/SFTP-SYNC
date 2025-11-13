@@ -1,12 +1,15 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
     time::{Duration, SystemTime},
 };
 
+use serde::{Deserialize, Serialize};
+
 pub type TargetId = u64;
 pub type SessionId = u64;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RemoteTarget {
     pub id: TargetId,
     pub name: String,
@@ -14,22 +17,29 @@ pub struct RemoteTarget {
     pub username: String,
     pub base_path: PathBuf,
     pub rules: Vec<SyncRule>,
+    #[serde(default)]
+    pub password: String,
 }
 
 impl RemoteTarget {
     pub fn summary(&self) -> String {
-        format!("{}@{}{}", self.username, self.host, self.base_path.display())
+        format!(
+            "{}@{}{}",
+            self.username,
+            self.host,
+            self.base_path.display()
+        )
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncRule {
     pub local: PathBuf,
     pub remote: PathBuf,
     pub direction: SyncDirection,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum SyncDirection {
     Push,
     Pull,
@@ -95,6 +105,7 @@ impl Default for AppSettings {
 pub enum ActiveView {
     Dashboard,
     Settings,
+    TargetSettings,
 }
 
 pub struct AppState {
@@ -104,44 +115,30 @@ pub struct AppState {
     pub settings: AppSettings,
     pub active_target: Option<TargetId>,
     pub active_view: ActiveView,
+    pub target_form: Option<TargetFormMode>,
+    pub connection_tests: HashMap<TargetId, ConnectionTestState>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TargetFormMode {
+    Create,
+    Edit(TargetId),
+}
+
+#[derive(Clone)]
+pub enum ConnectionTestState {
+    InProgress,
+    Success(String),
+    Failure(String),
 }
 
 impl AppState {
-    pub fn new(settings: AppSettings) -> Self {
-        let remote_targets = vec![
-            RemoteTarget {
-                id: 1,
-                name: "Production".into(),
-                host: "prod.example.com:22".into(),
-                username: "deploy".into(),
-                base_path: PathBuf::from("/srv/www"),
-                rules: vec![
-                    SyncRule {
-                        local: PathBuf::from("./apps/web"),
-                        remote: PathBuf::from("/web"),
-                        direction: SyncDirection::Push,
-                    },
-                    SyncRule {
-                        local: PathBuf::from("./secrets"),
-                        remote: PathBuf::from("/config"),
-                        direction: SyncDirection::Bidirectional,
-                    },
-                ],
-            },
-            RemoteTarget {
-                id: 2,
-                name: "Analytics".into(),
-                host: "analytics.internal:2200".into(),
-                username: "etl".into(),
-                base_path: PathBuf::from("/data"),
-                rules: vec![SyncRule {
-                    local: PathBuf::from("./datasets"),
-                    remote: PathBuf::from("/incoming"),
-                    direction: SyncDirection::Pull,
-                }],
-            },
-        ];
-
+    pub fn new(settings: AppSettings, remote_targets: Vec<RemoteTarget>) -> Self {
+        let remote_targets = if remote_targets.is_empty() {
+            sample_remote_targets()
+        } else {
+            remote_targets
+        };
         let sessions = vec![
             SyncSession {
                 id: 1001,
@@ -181,12 +178,61 @@ impl AppState {
             remote_targets,
             sessions,
             logs,
+            target_form: None,
+            connection_tests: HashMap::new(),
         }
+    }
+
+    pub fn next_target_id(&self) -> TargetId {
+        self.remote_targets
+            .iter()
+            .map(|target| target.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
     }
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        Self::new(AppSettings::default())
+        Self::new(AppSettings::default(), sample_remote_targets())
     }
+}
+
+pub fn sample_remote_targets() -> Vec<RemoteTarget> {
+    vec![
+        RemoteTarget {
+            id: 1,
+            name: "Production".into(),
+            host: "prod.example.com:22".into(),
+            username: "deploy".into(),
+            base_path: PathBuf::from("/srv/www"),
+            rules: vec![
+                SyncRule {
+                    local: PathBuf::from("./apps/web"),
+                    remote: PathBuf::from("/web"),
+                    direction: SyncDirection::Push,
+                },
+                SyncRule {
+                    local: PathBuf::from("./secrets"),
+                    remote: PathBuf::from("/config"),
+                    direction: SyncDirection::Bidirectional,
+                },
+            ],
+            password: String::new(),
+        },
+        RemoteTarget {
+            id: 2,
+            name: "Analytics".into(),
+            host: "analytics.internal:2200".into(),
+            username: "etl".into(),
+            base_path: PathBuf::from("/data"),
+            rules: vec![SyncRule {
+                local: PathBuf::from("./datasets"),
+                remote: PathBuf::from("/incoming"),
+                direction: SyncDirection::Pull,
+            }],
+            password: String::new(),
+        },
+    ]
 }

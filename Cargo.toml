@@ -11,3 +11,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dirs = "5.0"
 sys-locale = "0.3"
+ssh2 = "0.9"
+
+[dev-dependencies]
+tempfile = "3.12"
