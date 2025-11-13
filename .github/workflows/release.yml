@@ -43,6 +43,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev
+
       - name: Install Rust and build target
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -62,23 +68,24 @@ jobs:
             echo "name=${{ env.BINARY_NAME }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Package artifact
+      - name: Package artifact (Unix)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
         shell: bash
         run: |
           BINARY_PATH="target/${{ matrix.target }}/release/${{ steps.package_name.outputs.name }}"
-          
           mkdir -p dist
           cp "${BINARY_PATH}" "dist/"
-          
-          if [ "${{ runner.os }}" == "Linux" ] || [ "${{ runner.os }}" == "macOS" ]; then
-            strip "dist/${{ steps.package_name.outputs.name }}"
-          fi
-          
-          if [ "${{ runner.os }}" == "Windows" ]; then
-            (cd dist && zip -r "../${{ matrix.archive_name }}" *)
-          else
-            (cd dist && tar czf "../${{ matrix.archive_name }}" *)
-          fi
+          strip "dist/${{ steps.package_name.outputs.name }}"
+          (cd dist && tar czf "../${{ matrix.archive_name }}" *)
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binaryPath = "target/${{ matrix.target }}/release/${{ steps.package_name.outputs.name }}"
+          New-Item -ItemType Directory -Path "dist"
+          Copy-Item -Path $binaryPath -Destination "dist/"
+          Compress-Archive -Path "dist/*" -DestinationPath "${{ matrix.archive_name }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -108,7 +115,6 @@ jobs:
           git config user.name github-actions
           git config user.email github-actions@github.com
           
-          # Check if tag already exists locally and remotely
           if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
             echo "Tag $TAG_NAME already exists locally."
           elif git ls-remote --tags origin "$TAG_NAME" | grep -q "$TAG_NAME"; then
