@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BINARY_NAME: SFTP-SYNC
+
+jobs:
+  build-and-package:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            label: macOS
+            artifact_name: SFTP-SYNC-macos
+            archive_name: SFTP-SYNC-macos.zip
+            bin_path: target/release/SFTP-SYNC
+          - os: windows-latest
+            label: Windows
+            artifact_name: SFTP-SYNC-windows
+            archive_name: SFTP-SYNC-windows.zip
+            bin_path: target/release/SFTP-SYNC.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package artifact (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.bin_path }}" dist/${{ env.BINARY_NAME }}
+          strip -x dist/${{ env.BINARY_NAME }}
+          (cd dist && zip -r "../${{ matrix.archive_name }}" "${{ env.BINARY_NAME }}")
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -Type Directory dist | Out-Null
+          Copy-Item "${{ matrix.bin_path }}" "dist\\${{ env.BINARY_NAME }}.exe"
+          Compress-Archive -Path dist\* -DestinationPath "${{ matrix.archive_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive_name }}
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive_name }}

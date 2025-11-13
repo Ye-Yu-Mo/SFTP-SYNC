@@ -6,7 +6,7 @@ use crossbeam_channel::{unbounded, Receiver as SyncReceiver, Sender as SyncSende
 use once_cell::sync::Lazy;
 
 use crate::{
-    model::RemoteTarget,
+    model::{AppSettings, RemoteTarget},
     sync::{
         execute_jobs_with_progress, plan_jobs_with_progress, ExecutionSummary, PlanJobsResult,
         SyncJob,
@@ -29,6 +29,7 @@ enum TaskMessage {
     Execute {
         target: RemoteTarget,
         jobs: Vec<SyncJob>,
+        settings: AppSettings,
         respond_to: ExecuteResponder,
     },
 }
@@ -75,6 +76,7 @@ fn spawn_worker(receiver: SyncReceiver<TaskMessage>, index: usize) {
                     TaskMessage::Execute {
                         target,
                         jobs,
+                        settings,
                         respond_to,
                     } => {
                         let total_actions: usize =
@@ -83,13 +85,19 @@ fn spawn_worker(receiver: SyncReceiver<TaskMessage>, index: usize) {
                             completed: 0,
                             total: total_actions,
                         });
-                        let result = execute_jobs_with_progress(&target, &jobs, |completed, total| {
-                            let total = total.max(1);
-                            let _ = respond_to.send_blocking(TaskEvent::Progress {
-                                completed: completed.min(total),
-                                total,
+                        let limit = if settings.limit_bandwidth {
+                            Some(settings.bandwidth_mbps)
+                        } else {
+                            None
+                        };
+                        let result =
+                            execute_jobs_with_progress(&target, &jobs, limit, |completed, total| {
+                                let total = total.max(1);
+                                let _ = respond_to.send_blocking(TaskEvent::Progress {
+                                    completed: completed.min(total),
+                                    total,
+                                });
                             });
-                        });
                         let _ = respond_to.send_blocking(TaskEvent::Finished(result));
                     }
                 }
@@ -117,11 +125,13 @@ pub fn submit_plan(target: RemoteTarget) -> AsyncReceiver<TaskEvent<PlanJobsResu
 pub fn submit_execute(
     target: RemoteTarget,
     jobs: Vec<SyncJob>,
+    settings: AppSettings,
 ) -> AsyncReceiver<TaskEvent<ExecutionSummary>> {
     let (tx, rx) = bounded(16);
     TASK_QUEUE.submit(TaskMessage::Execute {
         target,
         jobs,
+        settings,
         respond_to: tx,
     });
     rx

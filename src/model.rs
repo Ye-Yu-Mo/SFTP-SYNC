@@ -6,12 +6,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::sync::{plan_jobs_for_target, PlanJobsResult, SyncJob};
+use crate::sync::{PlanJobsResult, SyncJob};
 
 pub type TargetId = u64;
 pub type SessionId = u64;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct RemoteTarget {
     pub id: TargetId,
     pub name: String,
@@ -19,8 +19,7 @@ pub struct RemoteTarget {
     pub username: String,
     pub base_path: PathBuf,
     pub rules: Vec<SyncRule>,
-    #[serde(default)]
-    pub password: String,
+    pub auth: AuthMethod,
 }
 
 impl RemoteTarget {
@@ -31,6 +30,52 @@ impl RemoteTarget {
             self.host,
             self.base_path.display()
         )
+    }
+}
+
+#[derive(Clone)]
+pub enum AuthMethod {
+    Password {
+        secret: String,
+        #[allow(dead_code)]
+        stored: bool,
+    },
+    SshKey {
+        private_key: PathBuf,
+        passphrase: Option<String>,
+        #[allow(dead_code)]
+        passphrase_stored: bool,
+    },
+}
+
+impl AuthMethod {
+    pub fn password(secret: impl Into<String>) -> Self {
+        Self::Password {
+            secret: secret.into(),
+            stored: false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn ssh_key(path: PathBuf) -> Self {
+        Self::SshKey {
+            private_key: path,
+            passphrase: None,
+            passphrase_stored: false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_password(&self) -> bool {
+        matches!(self, AuthMethod::Password { .. })
+    }
+
+    #[allow(dead_code)]
+    pub fn secret(&self) -> Option<&str> {
+        match self {
+            AuthMethod::Password { secret, .. } => Some(secret.as_str()),
+            AuthMethod::SshKey { passphrase, .. } => passphrase.as_deref(),
+        }
     }
 }
 
@@ -168,6 +213,7 @@ pub struct AppState {
     pub jobs: Vec<SyncJob>,
     next_session_id: SessionId,
     pub task_progress: HashMap<TargetId, TaskProgress>,
+    pub bootstrap_pending: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -208,7 +254,7 @@ impl AppState {
             },
         ];
 
-        let mut state = Self {
+        let state = Self {
             active_target: remote_targets.first().map(|target| target.id),
             active_view: ActiveView::Dashboard,
             settings,
@@ -220,17 +266,8 @@ impl AppState {
             jobs: Vec::new(),
             next_session_id: 1,
             task_progress: HashMap::new(),
+            bootstrap_pending: true,
         };
-
-        for target in state.remote_targets.clone() {
-            match plan_jobs_for_target(&target) {
-                Ok(result) => state.apply_planned_jobs(target.id, result),
-                Err(err) => state.log_event(
-                    LogLevel::Error,
-                    format!("Failed to plan sync for {}: {err}", target.name),
-                ),
-            }
-        }
 
         state
     }
@@ -324,7 +361,7 @@ pub fn sample_remote_targets() -> Vec<RemoteTarget> {
                     direction: SyncDirection::Bidirectional,
                 },
             ],
-            password: String::new(),
+            auth: AuthMethod::password(String::new()),
         },
         RemoteTarget {
             id: 2,
@@ -337,7 +374,7 @@ pub fn sample_remote_targets() -> Vec<RemoteTarget> {
                 remote: PathBuf::from("/incoming"),
                 direction: SyncDirection::Pull,
             }],
-            password: String::new(),
+            auth: AuthMethod::password(String::new()),
         },
     ]
 }

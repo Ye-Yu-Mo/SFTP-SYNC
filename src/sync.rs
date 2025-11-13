@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -19,12 +19,14 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntryKind {
     File,
+    #[allow(dead_code)]
     Directory,
 }
 
 #[derive(Clone, Debug)]
 pub struct FileEntry {
     pub path: PathBuf,
+    #[allow(dead_code)]
     pub kind: EntryKind,
     pub size: u64,
     pub modified: SystemTime,
@@ -48,11 +50,22 @@ pub trait RemoteStore {
 
 #[derive(Clone, Debug)]
 pub enum SyncAction {
-    Upload { rel_path: PathBuf, size: u64 },
-    Download { rel_path: PathBuf, size: u64 },
+    Upload {
+        rel_path: PathBuf,
+        #[allow(dead_code)]
+        size: u64,
+    },
+    Download {
+        rel_path: PathBuf,
+        #[allow(dead_code)]
+        size: u64,
+    },
     DeleteRemote { rel_path: PathBuf },
     DeleteLocal { rel_path: PathBuf },
-    Conflict { rel_path: PathBuf },
+    Conflict {
+        #[allow(dead_code)]
+        rel_path: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,6 +81,7 @@ pub struct PlanStats {
 pub struct SyncPlan {
     pub rule: SyncRule,
     pub actions: Vec<SyncAction>,
+    #[allow(dead_code)]
     pub stats: PlanStats,
 }
 
@@ -77,14 +91,18 @@ pub type FileIndex = HashMap<PathBuf, FileEntry>;
 pub struct SyncJob {
     pub id: SessionId,
     pub target_id: TargetId,
+    #[allow(dead_code)]
     pub rule: SyncRule,
+    #[allow(dead_code)]
     pub local_index: FileIndex,
+    #[allow(dead_code)]
     pub remote_index: FileIndex,
     pub plan: SyncPlan,
     pub created_at: SystemTime,
 }
 
 impl SyncJob {
+    #[allow(dead_code)]
     pub fn plan<L: LocalStore, R: RemoteStore>(
         id: SessionId,
         target_id: TargetId,
@@ -328,6 +346,7 @@ fn index_entries(entries: Vec<FileEntry>) -> FileIndex {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn plan_jobs_for_target(target: &RemoteTarget) -> Result<PlanJobsResult> {
     plan_jobs_with_progress(target, |_completed, _total| {})
 }
@@ -346,7 +365,7 @@ pub fn plan_jobs_with_progress(
     let mut warnings = Vec::new();
 
     for (index, rule) in target.rules.iter().enumerate() {
-        match plan_single_job(target.id, rule, &local_store, &remote_store) {
+        match plan_single_job(target, rule, &local_store, &remote_store) {
             Ok(job) => jobs.push(job),
             Err(err) => warnings.push(format!(
                 "Failed to plan rule {} for {}: {err}",
@@ -368,18 +387,21 @@ pub fn plan_jobs_with_progress(
 }
 
 fn plan_single_job<L: LocalStore, R: RemoteStore>(
-    target_id: TargetId,
+    target: &RemoteTarget,
     rule: &SyncRule,
     local: &L,
     remote: &R,
 ) -> Result<PlannedJob> {
-    let local_index = index_entries(local.list(&rule.local)?);
-    let remote_index = index_entries(remote.list(&rule.remote)?);
-    let (actions, stats) = diff_actions(rule, &local_index, &remote_index);
+    let mut resolved_rule = rule.clone();
+    resolved_rule.remote = resolve_remote_root(&target.base_path, &rule.remote);
+
+    let local_index = index_entries(local.list(&resolved_rule.local)?);
+    let remote_index = index_entries(remote.list(&resolved_rule.remote)?);
+    let (actions, stats) = diff_actions(&resolved_rule, &local_index, &remote_index);
 
     Ok(PlannedJob {
-        target_id,
-        rule: rule.clone(),
+        target_id: target.id,
+        rule: resolved_rule,
         local_index,
         remote_index,
         actions,
@@ -388,13 +410,31 @@ fn plan_single_job<L: LocalStore, R: RemoteStore>(
     })
 }
 
+fn resolve_remote_root(base_path: &Path, rule_remote: &Path) -> PathBuf {
+    if rule_remote.is_absolute() {
+        return rule_remote.to_path_buf();
+    }
+
+    if base_path.as_os_str().is_empty() {
+        return rule_remote.to_path_buf();
+    }
+
+    if rule_remote.as_os_str().is_empty() {
+        return base_path.to_path_buf();
+    }
+
+    base_path.join(rule_remote)
+}
+
+#[allow(dead_code)]
 pub fn execute_jobs_for_target(target: &RemoteTarget, jobs: &[SyncJob]) -> Result<ExecutionSummary> {
-    execute_jobs_with_progress(target, jobs, |_completed, _total| {})
+    execute_jobs_with_progress(target, jobs, None, |_completed, _total| {})
 }
 
 pub fn execute_jobs_with_progress(
     target: &RemoteTarget,
     jobs: &[SyncJob],
+    bandwidth_limit_mbps: Option<u32>,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<ExecutionSummary> {
     if jobs.is_empty() {
@@ -405,7 +445,11 @@ pub fn execute_jobs_with_progress(
     let remote_store = SftpRemoteStore::connect(target)
         .with_context(|| format!("failed to connect to {}", target.host))?;
     let local_store = FsLocalStore::default();
-    let executor = SyncExecutor::new(&local_store, &remote_store);
+    let limiter = bandwidth_limit_mbps.map(|mbps| {
+        let bytes_per_sec = (mbps as u64).saturating_mul(125_000);
+        Mutex::new(BandwidthLimiter::new(bytes_per_sec))
+    });
+    let executor = SyncExecutor::new(&local_store, &remote_store, limiter);
 
     let total_actions: usize = jobs.iter().map(|job| job.plan.actions.len()).sum();
     let mut summary = ExecutionSummary::default();
@@ -591,10 +635,10 @@ fn newer(lhs: SystemTime, rhs: SystemTime) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Clone)]
 pub struct SyncExecutor<'a, L: LocalStore, R: RemoteStore> {
     local: &'a L,
     remote: &'a R,
+    limiter: Option<Mutex<BandwidthLimiter>>,
 }
 
 #[derive(Clone, Debug)]
@@ -611,8 +655,16 @@ pub struct ExecutionLog {
 }
 
 impl<'a, L: LocalStore, R: RemoteStore> SyncExecutor<'a, L, R> {
-    pub fn new(local: &'a L, remote: &'a R) -> Self {
-        Self { local, remote }
+    fn new(
+        local: &'a L,
+        remote: &'a R,
+        limiter: Option<Mutex<BandwidthLimiter>>,
+    ) -> Self {
+        Self {
+            local,
+            remote,
+            limiter,
+        }
     }
 
     pub fn execute(&self, plan: &SyncPlan) -> Vec<ExecutionLog> {
@@ -626,6 +678,7 @@ impl<'a, L: LocalStore, R: RemoteStore> SyncExecutor<'a, L, R> {
                         .and_then(|bytes| {
                             let parent = rel_path.parent().unwrap_or(Path::new(""));
                             self.remote.ensure_dir(&plan.rule.remote, parent)?;
+                            self.throttle(bytes.len());
                             self.remote.write_file(&plan.rule.remote, rel_path, &bytes)
                         })
                         .map(|_| ActionStatus::Applied)
@@ -636,6 +689,7 @@ impl<'a, L: LocalStore, R: RemoteStore> SyncExecutor<'a, L, R> {
                         .and_then(|bytes| {
                             let parent = rel_path.parent().unwrap_or(Path::new(""));
                             self.local.ensure_dir(&plan.rule.local, parent)?;
+                            self.throttle(bytes.len());
                             self.local.write_file(&plan.rule.local, rel_path, &bytes)
                         })
                         .map(|_| ActionStatus::Applied)
@@ -659,6 +713,51 @@ impl<'a, L: LocalStore, R: RemoteStore> SyncExecutor<'a, L, R> {
                 }
             })
             .collect()
+    }
+
+    fn throttle(&self, bytes: usize) {
+        if let Some(limiter) = &self.limiter {
+            if let Ok(mut guard) = limiter.lock() {
+                guard.consume(bytes as u64);
+            }
+        }
+    }
+}
+
+struct BandwidthLimiter {
+    limit_per_sec: f64,
+    allowance: f64,
+    last_check: Instant,
+}
+
+impl BandwidthLimiter {
+    fn new(limit_bytes_per_sec: u64) -> Self {
+        Self {
+            limit_per_sec: limit_bytes_per_sec as f64,
+            allowance: limit_bytes_per_sec as f64,
+            last_check: Instant::now(),
+        }
+    }
+
+    fn consume(&mut self, bytes: u64) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_check).as_secs_f64();
+        self.last_check = now;
+        self.allowance =
+            (self.allowance + elapsed * self.limit_per_sec).min(self.limit_per_sec);
+
+        let bytes_needed = bytes as f64;
+        if self.allowance >= bytes_needed {
+            self.allowance -= bytes_needed;
+            return;
+        }
+
+        let deficit = bytes_needed - self.allowance;
+        let sleep_seconds = deficit / self.limit_per_sec;
+        if sleep_seconds.is_finite() && sleep_seconds > 0.0 {
+            std::thread::sleep(Duration::from_secs_f64(sleep_seconds));
+        }
+        self.allowance = self.limit_per_sec - deficit.clamp(0.0, self.limit_per_sec);
     }
 }
 
@@ -850,7 +949,7 @@ mod tests {
         assert_eq!(plan.stats.uploads, 1);
 
         let executor_store = FsLocalStore::default();
-        let executor = SyncExecutor::new(&executor_store, &remote);
+        let executor = SyncExecutor::new(&executor_store, &remote, None);
         let logs = executor.execute(&plan);
         assert!(matches!(logs[0].status, ActionStatus::Applied));
 
@@ -858,5 +957,24 @@ mod tests {
             .read_file(Path::new("/remote"), Path::new("upload.txt"))
             .unwrap();
         assert_eq!(bytes, b"payload");
+    }
+
+    #[test]
+    fn resolve_remote_root_joins_base_path() {
+        let resolved =
+            super::resolve_remote_root(Path::new("/srv/www"), Path::new("apps/web"));
+        assert_eq!(resolved, PathBuf::from("/srv/www/apps/web"));
+    }
+
+    #[test]
+    fn resolve_remote_root_preserves_absolute_paths() {
+        let resolved = super::resolve_remote_root(Path::new("/srv/www"), Path::new("/data"));
+        assert_eq!(resolved, PathBuf::from("/data"));
+    }
+
+    #[test]
+    fn resolve_remote_root_handles_empty_relative_path() {
+        let resolved = super::resolve_remote_root(Path::new("/srv/www"), Path::new(""));
+        assert_eq!(resolved, PathBuf::from("/srv/www"));
     }
 }

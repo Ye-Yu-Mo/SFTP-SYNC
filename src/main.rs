@@ -1,8 +1,11 @@
 mod config;
 mod connection;
+mod secrets;
+mod security;
 mod model;
 mod sync;
 mod task_queue;
+mod watcher;
 mod view;
 
 use gpui::*;

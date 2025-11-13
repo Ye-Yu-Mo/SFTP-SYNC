@@ -1,4 +1,6 @@
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     path::PathBuf,
     time::{Duration, SystemTime},
 };
@@ -7,16 +9,18 @@ use crate::{
     config::save_state,
     connection,
     model::{
-        ActiveView, AppSettings, AppState, ConnectionTestState, Language, LogLevel, RemoteTarget,
-        SyncDirection, SyncRule, SyncSession, SyncStatus, TargetFormMode, TargetId, TaskKind,
-        TaskProgress,
+        ActiveView, AppSettings, AppState, AuthMethod, ConnectionTestState, Language, LogLevel,
+        RemoteTarget, SyncDirection, SyncRule, SyncSession, SyncStatus, TargetFormMode, TargetId,
+        TaskKind, TaskProgress,
     },
+    sync::{SyncAction, SyncJob},
     task_queue::{self, TaskEvent},
+    watcher::{self, WatchTarget},
 };
 use anyhow::Error;
 use gpui::{
-    AppContext, Axis, Context, Div, Entity, IntoElement, ParentElement as _, Render, Styled as _,
-    Window, div, prelude::FluentBuilder as _,
+    App, AppContext, AsyncApp, Axis, Context, Div, Entity, IntoElement, ParentElement as _, Render,
+    Styled as _, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::{
     ActiveTheme, ContextModal, Disableable, Icon, IconName, Root, Sizable as _, StyledExt,
@@ -34,6 +38,10 @@ pub struct AppView {
     state: Entity<AppState>,
     target_form_view: Option<Entity<TargetFormView>>,
     current_form_mode: Option<TargetFormMode>,
+    bootstrapped: bool,
+    watch_listener_started: bool,
+    last_watch_signature: Option<u64>,
+    auto_connect_triggered: bool,
 }
 
 impl AppView {
@@ -42,7 +50,217 @@ impl AppView {
             state,
             target_form_view: None,
             current_form_mode: None,
+            bootstrapped: false,
+            watch_listener_started: false,
+            last_watch_signature: None,
+            auto_connect_triggered: false,
         }
+    }
+
+    fn ensure_watch_listener(&mut self, cx: &mut Context<Self>) {
+        if self.watch_listener_started {
+            return;
+        }
+
+        let (tx, rx) = async_channel::unbounded();
+        watcher::ensure_service(tx);
+
+        let handle = self.state.clone();
+        {
+            let app: &mut App = cx;
+            app.spawn(async move |cx| {
+                while let Ok(event) = rx.recv().await {
+                    let maybe_target = handle
+                        .update(cx, |state, _| {
+                            state
+                                .remote_targets
+                                .iter()
+                                .find(|target| target.id == event.target_id)
+                                .cloned()
+                        })
+                        .ok()
+                        .flatten();
+                    if let Some(target) = maybe_target {
+                        AppView::schedule_plan_for_target_async(
+                            &handle,
+                            target.clone(),
+                            Some(format!(
+                                "Detected local changes for {}, refreshing plan",
+                                target.name
+                            )),
+                            cx,
+                        );
+                    }
+                }
+                Ok::<_, Error>(())
+            })
+            .detach();
+        }
+
+        self.watch_listener_started = true;
+    }
+
+    fn configure_watchers(&mut self, enabled: bool, targets: &[RemoteTarget]) {
+        let mut hasher = DefaultHasher::new();
+        enabled.hash(&mut hasher);
+        for target in targets {
+            target.id.hash(&mut hasher);
+            for rule in &target.rules {
+                rule.local.hash(&mut hasher);
+            }
+        }
+        let signature = hasher.finish();
+        if self.last_watch_signature == Some(signature) {
+            return;
+        }
+        self.last_watch_signature = Some(signature);
+
+        let configs = if enabled {
+            targets
+                .iter()
+                .map(|target| WatchTarget {
+                    target_id: target.id,
+                    roots: target.rules.iter().map(|rule| rule.local.clone()).collect(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        watcher::configure(enabled, configs);
+    }
+
+    fn bootstrap_targets(&mut self, targets: &[RemoteTarget], cx: &mut Context<Self>) {
+        let handle = self.state.clone();
+        for target in targets.to_vec() {
+            schedule_plan_for_target(
+                &handle,
+                target.clone(),
+                Some(format!(
+                    "Preparing sync plan for {}",
+                    target.name
+                )),
+                cx,
+            );
+        }
+
+        handle.update(cx, |state, cx| {
+            state.bootstrap_pending = false;
+            cx.notify();
+        });
+        self.bootstrapped = true;
+    }
+
+    fn schedule_plan_for_target_async(
+        state_handle: &Entity<AppState>,
+        target: RemoteTarget,
+        log_message: Option<String>,
+        cx: &mut AsyncApp,
+    ) {
+        let target_id = target.id;
+        let planning = state_handle
+            .read_with(cx, |state, _| plan_in_progress(state, target_id))
+            .unwrap_or(false);
+        if planning {
+            return;
+        }
+
+        let total_rules = target.rules.len().max(1);
+        let target_name = target.name.clone();
+
+        let _ = state_handle.update(cx, |state, cx| {
+            if let Some(message) = log_message.clone() {
+                state.log_event(LogLevel::Info, message);
+            }
+
+            let mut touched = false;
+            for session in state
+                .sessions
+                .iter_mut()
+                .filter(|session| session.target_id == target_id)
+            {
+                session.status = SyncStatus::Planning;
+                session.last_run = Some(SystemTime::now());
+                touched = true;
+            }
+
+            if !touched {
+                let id = state.next_session_id();
+                state.sessions.push(SyncSession {
+                    id,
+                    target_id,
+                    status: SyncStatus::Planning,
+                    last_run: Some(SystemTime::now()),
+                    pending_actions: 0,
+                });
+            }
+
+            state.set_task_progress(
+                target_id,
+                TaskProgress::new(TaskKind::Planning, 0, total_rules),
+            );
+            cx.notify();
+        });
+
+        let receiver = task_queue::submit_plan(target.clone());
+        let handle = state_handle.clone();
+        cx.spawn(async move |cx| {
+            while let Ok(event) = receiver.recv().await {
+                match event {
+                    TaskEvent::Progress { completed, total } => {
+                        let _ = handle.update(cx, |state, cx| {
+                            state.set_task_progress(
+                                target_id,
+                                TaskProgress::new(TaskKind::Planning, completed, total),
+                            );
+                            cx.notify();
+                        });
+                    }
+                    TaskEvent::Finished(result) => {
+                        let _ = handle.update(cx, |state, cx| {
+                            state.clear_task_progress(target_id);
+                            cx.notify();
+                        });
+                        match result {
+                            Ok(plan) => {
+                                let _ = handle.update(cx, |state, cx| {
+                                    state.apply_planned_jobs(target_id, plan);
+                                    let pending: usize = state
+                                        .jobs
+                                        .iter()
+                                        .filter(|job| job.target_id == target_id)
+                                        .map(|job| job.pending_actions())
+                                        .sum();
+                                    state.log_event(
+                                        LogLevel::Info,
+                                        format!(
+                                            "Sync plan ready for {} ({} actions)",
+                                            target_name, pending
+                                        ),
+                                    );
+                                    cx.notify();
+                                });
+                            }
+                            Err(err) => {
+                                let _ = handle.update(cx, |state, cx| {
+                                    state.log_event(
+                                        LogLevel::Error,
+                                        format!(
+                                            "Failed to prepare sync plan for {}: {err}",
+                                            target_name
+                                        ),
+                                    );
+                                    cx.notify();
+                                });
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            Ok::<_, Error>(())
+        })
+        .detach();
     }
 }
 
@@ -58,6 +276,7 @@ impl Render for AppView {
             target_form_mode,
             connection_tests,
             task_progress_map,
+            bootstrap_pending,
         ) = {
             let state = self.state.read(cx);
             (
@@ -70,9 +289,30 @@ impl Render for AppView {
                 state.target_form,
                 state.connection_tests.clone(),
                 state.task_progress.clone(),
+                state.bootstrap_pending,
             )
         };
         let language = settings.language;
+
+        if !self.bootstrapped && bootstrap_pending {
+            self.bootstrap_targets(&remote_targets, cx);
+        }
+
+        self.ensure_watch_listener(cx);
+        self.configure_watchers(settings.watch_local_changes, &remote_targets);
+
+        if settings.auto_connect && !self.auto_connect_triggered {
+            if let Some(active_id) = active_target_id {
+                if let Some(target) = remote_targets
+                    .iter()
+                    .find(|t| t.id == active_id)
+                    .cloned()
+                {
+                    run_connection_test(&self.state, target, language, cx);
+                    self.auto_connect_triggered = true;
+                }
+            }
+        }
 
         match target_form_mode {
             Some(mode) => {
@@ -392,40 +632,44 @@ impl Render for AppView {
                                         .on_click(move |_, _, cx| {
                                             let handle = test_handle.clone();
                                             let target_clone = target_for_test.clone();
-                                            cx.spawn(async move |cx| {
-                                                let _ = handle.update(cx, |state, cx| {
-                                                    state.connection_tests.insert(
-                                                        target_clone.id,
-                                                        ConnectionTestState::InProgress,
-                                                    );
-                                                    cx.notify();
-                                                });
+                                            cx.spawn({
+                                                async move |cx| {
+                                                    let _ = handle.update(cx, |state, cx| {
+                                                        state.connection_tests.insert(
+                                                            target_clone.id,
+                                                            ConnectionTestState::InProgress,
+                                                        );
+                                                        cx.notify();
+                                                    });
 
-                                                let result =
-                                                    connection::test_connection(&target_clone);
+                                                    let result =
+                                                        connection::test_connection(&target_clone);
 
-                                                let _ = handle.update(cx, |state, cx| {
-                                                    let status = match result {
-                                                        Ok(_) => ConnectionTestState::Success(
-                                                            tr(
-                                                                language,
-                                                                "Connection OK",
-                                                                "连接成功",
-                                                                "連線成功",
-                                                            )
-                                                            .into(),
-                                                        ),
-                                                        Err(err) => ConnectionTestState::Failure(
-                                                            err.to_string(),
-                                                        ),
-                                                    };
-                                                    state
-                                                        .connection_tests
-                                                        .insert(target_clone.id, status);
-                                                    cx.notify();
-                                                });
+                                                    let _ = handle.update(cx, |state, cx| {
+                                                        let status = match result {
+                                                            Ok(_) => ConnectionTestState::Success(
+                                                                tr(
+                                                                    language,
+                                                                    "Connection OK",
+                                                                    "连接成功",
+                                                                    "連線成功",
+                                                                )
+                                                                .into(),
+                                                            ),
+                                                            Err(err) => {
+                                                                ConnectionTestState::Failure(
+                                                                    err.to_string(),
+                                                                )
+                                                            }
+                                                        };
+                                                        state
+                                                            .connection_tests
+                                                            .insert(target_clone.id, status);
+                                                        cx.notify();
+                                                    });
 
-                                                Ok::<_, Error>(())
+                                                    Ok::<_, Error>(())
+                                                }
                                             })
                                             .detach();
                                         })
@@ -451,11 +695,27 @@ impl Render for AppView {
                                                 let handle = plan_handle.clone();
                                                 let target_name = plan_target.name.clone();
                                                 handle.update(cx, |state, cx| {
-                                                    for session in state.sessions.iter_mut().filter(
-                                                        |session| session.target_id == plan_target.id,
-                                                    ) {
+                                                    let mut touched = false;
+                                                    for session in state
+                                                        .sessions
+                                                        .iter_mut()
+                                                        .filter(|session| {
+                                                            session.target_id == plan_target.id
+                                                        })
+                                                    {
                                                         session.status = SyncStatus::Planning;
                                                         session.last_run = Some(SystemTime::now());
+                                                        touched = true;
+                                                    }
+                                                    if !touched {
+                                                        let id = state.next_session_id();
+                                                        state.sessions.push(SyncSession {
+                                                            id,
+                                                            target_id: plan_target.id,
+                                                            status: SyncStatus::Planning,
+                                                            last_run: Some(SystemTime::now()),
+                                                            pending_actions: 0,
+                                                        });
                                                     }
                                                     state.set_task_progress(
                                                         plan_target.id,
@@ -467,79 +727,75 @@ impl Render for AppView {
                                                     );
                                                     state.log_event(
                                                         LogLevel::Info,
-                                                        format!("Planning sync for {target_name}"),
+                                                        format!(
+                                                            "Planning sync for {}",
+                                                            target_name
+                                                        ),
                                                     );
                                                     cx.notify();
                                                 });
                                             }
 
-                                            let async_handle = plan_handle.clone();
-                                            cx.spawn({
-                                                let snapshot = plan_target.clone();
-                                                async move |cx| {
-                                                    let target_name = snapshot.name.clone();
-                                                    let receiver = task_queue::submit_plan(snapshot.clone());
-                                                    while let Ok(event) = receiver.recv().await {
-                                                        match event {
-                                                            TaskEvent::Progress { completed, total } => {
-                                                                let _ = async_handle.update(cx, |state, cx| {
-                                                                    state.set_task_progress(
-                                                                        snapshot.id,
-                                                                        TaskProgress::new(
-                                                                            TaskKind::Planning,
-                                                                            completed,
-                                                                            total,
-                                                                        ),
-                                                                    );
-                                                                    cx.notify();
-                                                                });
-                                                            }
-                                                            TaskEvent::Finished(result) => {
-                                                                let _ = async_handle.update(cx, |state, cx| {
-                                                                    state.clear_task_progress(snapshot.id);
-                                                                    cx.notify();
-                                                                });
-                                                                match result {
-                                                                    Ok(result) => {
-                                                                        let pending: usize = result
-                                                                            .jobs
-                                                                            .iter()
-                                                                            .map(|job| job.actions.len())
-                                                                            .sum();
-                                                                        let _ = async_handle.update(cx, |state, cx| {
-                                                                            state.apply_planned_jobs(
-                                                                                snapshot.id,
-                                                                                result,
-                                                                            );
-                                                                            state.log_event(
-                                                                                LogLevel::Info,
-                                                                                format!(
-                                                                                    "Dry run ready for {target_name} ({pending} actions)"
-                                                                                ),
-                                                                            );
-                                                                            cx.notify();
-                                                                        });
-                                                                    }
-                                                                    Err(err) => {
-                                                                        let _ = async_handle.update(cx, |state, cx| {
-                                                                            state.log_event(
-                                                                                LogLevel::Error,
-                                                                                format!(
-                                                                                    "Planning failed for {target_name}: {err}"
-                                                                                ),
-                                                                            );
-                                                                            cx.notify();
-                                                                        });
-                                                                    }
-                                                                }
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                    Ok::<_, Error>(())
-                                                }
-                                            })
-                                            .detach();
+        let async_handle = plan_handle.clone();
+        cx.spawn({
+            let snapshot = plan_target.clone();
+            async move |cx| {
+                let target_name = snapshot.name.clone();
+                let receiver = task_queue::submit_plan(snapshot.clone());
+                while let Ok(event) = receiver.recv().await {
+                    match event {
+                        TaskEvent::Progress { completed, total } => {
+                            let _ = async_handle.update(cx, |state, cx| {
+                                state.set_task_progress(
+                                    snapshot.id,
+                                    TaskProgress::new(TaskKind::Planning, completed, total),
+                                );
+                                cx.notify();
+                            });
+                        }
+                        TaskEvent::Finished(result) => {
+                            let _ = async_handle.update(cx, |state, cx| {
+                                state.clear_task_progress(snapshot.id);
+                                cx.notify();
+                            });
+                            match result {
+                                Ok(result) => {
+                                    let pending: usize = result
+                                        .jobs
+                                        .iter()
+                                        .map(|job| job.actions.len())
+                                        .sum();
+                                    let _ = async_handle.update(cx, |state, cx| {
+                                        state.apply_planned_jobs(snapshot.id, result);
+                                        state.log_event(
+                                            LogLevel::Info,
+                                            format!(
+                                                "Dry run ready for {target_name} ({pending} actions)"
+                                            ),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = async_handle.update(cx, |state, cx| {
+                                        state.log_event(
+                                            LogLevel::Error,
+                                            format!(
+                                                "Planning failed for {target_name}: {err}"
+                                            ),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                Ok::<_, Error>(())
+            }
+        })
+        .detach();
                                         })
                                })
                                 .child({
@@ -549,8 +805,8 @@ impl Render for AppView {
                                         .success()
                                         .label(tr(language, "Execute Sync", "执行同步", "執行同步"))
                                         .icon(Icon::new(IconName::Check).small())
-                                        .on_click(move |_, _, cx| {
-                                            let maybe_snapshot = execute_handle.update(cx, |state, cx| {
+                                        .on_click(move |_, window, cx| {
+                                            let snapshot = execute_handle.update(cx, |state, cx| {
                                                 let jobs: Vec<_> = state
                                                     .jobs
                                                     .iter()
@@ -582,209 +838,67 @@ impl Render for AppView {
                                                     format!("Executing sync for {}", execute_target.name),
                                                 );
                                                 cx.notify();
-                                                Some(jobs)
+                                                Some((jobs, state.settings.clone()))
                                             });
 
-                                            if let Some(job_snapshot) = maybe_snapshot {
-                                                let exec_receiver =
-                                                    task_queue::submit_execute(execute_target.clone(), job_snapshot);
+                                            let Some((jobs, settings)) = snapshot else {
+                                                return;
+                                            };
+                                            let (delete_local, delete_remote) = destructive_counts(&jobs);
+                                            if settings.confirm_destructive
+                                                && (delete_local + delete_remote > 0)
+                                            {
                                                 let handle = execute_handle.clone();
-                                                cx.spawn({
-                                                    let target_snapshot = execute_target.clone();
-                                                    async move |cx| {
-                                                        loop {
-                                                            match exec_receiver.recv().await {
-                                                                Ok(TaskEvent::Progress { completed, total }) => {
-                                                                    let _ = handle.update(cx, |state, cx| {
-                                                                        state.set_task_progress(
-                                                                            target_snapshot.id,
-                                                                            TaskProgress::new(
-                                                                                TaskKind::Executing,
-                                                                                completed,
-                                                                                total,
-                                                                            ),
-                                                                        );
-                                                                        cx.notify();
-                                                                    });
-                                                                    continue;
-                                                                }
-                                                                Ok(TaskEvent::Finished(Ok(summary))) => {
-                                                                let _ = handle.update(cx, |state, cx| {
-                                                                    if summary.failures.is_empty() {
-                                                                        state.log_event(
-                                                                            LogLevel::Info,
-                                                                            format!(
-                                                                                "Sync completed for {} ({} actions, {} conflicts)",
-                                                                                target_snapshot.name,
-                                                                                summary.applied,
-                                                                                summary.skipped
-                                                                            ),
-                                                                        );
-                                                                        for session in state
-                                                                            .sessions
-                                                                            .iter_mut()
-                                                                            .filter(|session| session.target_id == target_snapshot.id)
-                                                                        {
-                                                                            session.status = SyncStatus::Completed;
-                                                                            session.last_run =
-                                                                                Some(SystemTime::now());
-                                                                        }
-                                                                    } else {
-                                                                        let failure_count =
-                                                                            summary.failures.len();
-                                                                        let first_error = summary
-                                                                            .failures
-                                                                            .first()
-                                                                            .map(|(_, reason)| reason.clone())
-                                                                            .unwrap_or_else(|| "Unknown failure".into());
-                                                                        state.log_event(
-                                                                            LogLevel::Error,
-                                                                            format!(
-                                                                                "Sync finished with {failure_count} failures for {}: {first_error}",
-                                                                                target_snapshot.name
-                                                                            ),
-                                                                        );
-                                                                        for session in state
-                                                                            .sessions
-                                                                            .iter_mut()
-                                                                            .filter(|session| session.target_id == target_snapshot.id)
-                                                                        {
-                                                                            session.status = SyncStatus::Failed {
-                                                                                reason: first_error.clone(),
-                                                                            };
-                                                                            session.last_run =
-                                                                                Some(SystemTime::now());
-                                                                        }
-                                                                    }
-                                                                    cx.notify();
-                                                                });
-
-                                                                let follow_receiver =
-                                                                    task_queue::submit_plan(target_snapshot.clone());
-                                                                loop {
-                                                                    match follow_receiver.recv().await {
-                                                                        Ok(TaskEvent::Progress { completed, total }) => {
-                                                                            let _ = handle.update(cx, |state, cx| {
-                                                                                state.set_task_progress(
-                                                                                    target_snapshot.id,
-                                                                                    TaskProgress::new(
-                                                                                        TaskKind::Planning,
-                                                                                        completed,
-                                                                                        total,
-                                                                                    ),
-                                                                                );
-                                                                                cx.notify();
-                                                                            });
-                                                                            continue;
-                                                                        }
-                                                                        Ok(TaskEvent::Finished(Ok(plan))) => {
-                                                                            let _ = handle.update(cx, |state, cx| {
-                                                                                state.apply_planned_jobs(
-                                                                                    target_snapshot.id,
-                                                                                    plan,
-                                                                                );
-                                                                                state.clear_task_progress(
-                                                                                    target_snapshot.id,
-                                                                                );
-                                                                                cx.notify();
-                                                                            });
-                                                                            break;
-                                                                        }
-                                                                        Ok(TaskEvent::Finished(Err(err))) => {
-                                                                            let _ = handle.update(cx, |state, cx| {
-                                                                                state.clear_task_progress(
-                                                                                    target_snapshot.id,
-                                                                                );
-                                                                                state.log_event(
-                                                                                    LogLevel::Warn,
-                                                                                    format!(
-                                                                                        "Failed to refresh plan after sync for {}: {err}",
-                                                                                        target_snapshot.name
-                                                                                    ),
-                                                                                );
-                                                                                cx.notify();
-                                                                            });
-                                                                            break;
-                                                                        }
-                                                                        Err(recv_err) => {
-                                                                            let _ = handle.update(cx, |state, cx| {
-                                                                                state.clear_task_progress(
-                                                                                    target_snapshot.id,
-                                                                                );
-                                                                                state.log_event(
-                                                                                    LogLevel::Warn,
-                                                                                    format!(
-                                                                                        "Failed to refresh plan after sync for {}: {recv_err}",
-                                                                                        target_snapshot.name
-                                                                                    ),
-                                                                                );
-                                                                                cx.notify();
-                                                                            });
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                                break;
+                                                let target_snapshot = execute_target.clone();
+                                                window.open_modal(cx, move |modal, _, _| {
+                                                    let message = format!(
+                                                        "{}\n• {} {}\n• {} {}",
+                                                        tr(
+                                                            language,
+                                                            "Destructive changes detected. Proceed?",
+                                                            "检测到破坏性变更，是否继续？",
+                                                            "偵測到破壞性變更，是否繼續？",
+                                                        ),
+                                                        delete_local,
+                                                        tr(language, "local deletions", "本地删除", "本地刪除"),
+                                                        delete_remote,
+                                                        tr(language, "remote deletions", "远程删除", "遠端刪除"),
+                                                    );
+                                                    modal
+                                                        .confirm()
+                                                        .title(tr(
+                                                            language,
+                                                            "Confirm Destructive Sync",
+                                                            "确认破坏性同步",
+                                                            "確認破壞性同步",
+                                                        ))
+                                                    .child(div().p_4().child(message))
+                                                    .on_ok({
+                                                        let jobs_clone = jobs.clone();
+                                                        let settings_clone = settings.clone();
+                                                        let handle_inner = handle.clone();
+                                                        let target_inner = target_snapshot.clone();
+                                                        move |_, _, cx| {
+                                                            run_execute_jobs(
+                                                                cx,
+                                                                &handle_inner,
+                                                                target_inner.clone(),
+                                                                jobs_clone.clone(),
+                                                                settings_clone.clone(),
+                                                            );
+                                                                true
                                                             }
-                                                            Ok(TaskEvent::Finished(Err(err))) => {
-                                                                let message = err.to_string();
-                                                                let _ = handle.update(cx, |state, cx| {
-                                                                    state.log_event(
-                                                                        LogLevel::Error,
-                                                                        format!(
-                                                                            "Sync failed for {}: {}",
-                                                                            target_snapshot.name, message
-                                                                        ),
-                                                                    );
-                                                                    for session in state
-                                                                        .sessions
-                                                                        .iter_mut()
-                                                                        .filter(|session| session.target_id == target_snapshot.id)
-                                                                    {
-                                                                        session.status = SyncStatus::Failed {
-                                                                            reason: message.clone(),
-                                                                        };
-                                                                        session.last_run =
-                                                                            Some(SystemTime::now());
-                                                                    }
-                                                                    cx.notify();
-                                                                });
-                                                                break;
-                                                            }
-                                                            Err(recv_err) => {
-                                                                let message =
-                                                                    format!("task cancelled: {recv_err}");
-                                                                let _ = handle.update(cx, |state, cx| {
-                                                                    state.log_event(
-                                                                        LogLevel::Error,
-                                                                        format!(
-                                                                            "Sync failed for {}: {}",
-                                                                            target_snapshot.name, message
-                                                                        ),
-                                                                    );
-                                                                    for session in state
-                                                                        .sessions
-                                                                        .iter_mut()
-                                                                        .filter(|session| session.target_id == target_snapshot.id)
-                                                                    {
-                                                                        session.status = SyncStatus::Failed {
-                                                                            reason: message.clone(),
-                                                                        };
-                                                                        session.last_run =
-                                                                            Some(SystemTime::now());
-                                                                    }
-                                                                    cx.notify();
-                                                                });
-                                                                break;
-                                                            }
-                                                        }
-
-                                                        }
-
-                                                        Ok::<_, Error>(())
-                                                    }
-                                                })
-                                                .detach();
+                                                        })
+                                                        .on_cancel(|_, _, _| true)
+                                                });
+                                            } else {
+                                                run_execute_jobs(
+                                                    cx,
+                                                    &execute_handle,
+                                                    execute_target.clone(),
+                                                    jobs,
+                                                    settings,
+                                                );
                                             }
                                         })
                                 })
@@ -911,7 +1025,16 @@ impl Render for AppView {
                         Button::new("create_target")
                             .primary()
                             .label(tr(language, "Create Target", "创建目标", "建立目標"))
-                            .on_click(|_, _, _| println!("TODO: show create target modal")),
+                            .on_click({
+                                let handle = self.state.clone();
+                                move |_, _, cx| {
+                                    handle.update(cx, |state, cx| {
+                                        state.target_form = Some(TargetFormMode::Create);
+                                        state.active_view = ActiveView::TargetSettings;
+                                        cx.notify();
+                                    });
+                                }
+                            }),
                     ),
             });
 
@@ -1094,58 +1217,260 @@ fn render_target_form_panel(
     let host_input = form_state.host.clone();
     let username_input = form_state.username.clone();
     let base_path_input = form_state.base_path.clone();
-    let local_path_input = form_state.local_path.clone();
-    let remote_path_input = form_state.remote_path.clone();
     let password_input = form_state.password.clone();
-    let direction = form_state.direction;
+    let private_key_input = form_state.private_key.clone();
+    let passphrase_input = form_state.passphrase.clone();
+    let auth_choice = form_state.auth_choice;
+    let rule_inputs = form_state.rules.clone();
 
     let name_value = current_input_value(&name_input, cx);
     let host_value = current_input_value(&host_input, cx);
     let username_value = current_input_value(&username_input, cx);
     let base_path_value = current_input_value(&base_path_input, cx);
-    let local_value = current_input_value(&local_path_input, cx);
-    let remote_value = current_input_value(&remote_path_input, cx);
-
     let password_value = current_input_value(&password_input, cx);
+    let private_key_value = current_input_value(&private_key_input, cx);
 
-    let ready_to_submit = [
-        &name_value,
-        &host_value,
-        &username_value,
-        &base_path_value,
-        &local_value,
-        &remote_value,
-        &password_value,
-    ]
-    .iter()
-    .all(|value| !value.trim().is_empty());
+    let rules_ready = !rule_inputs.is_empty()
+        && rule_inputs.iter().all(|rule| {
+            let local_value = current_input_value(&rule.local, cx);
+            let remote_value = current_input_value(&rule.remote, cx);
+            !local_value.trim().is_empty() && !remote_value.trim().is_empty()
+        });
 
-    let direction_buttons = [
-        SyncDirection::Push,
-        SyncDirection::Pull,
-        SyncDirection::Bidirectional,
-    ]
-    .into_iter()
-    .fold(div().h_flex().gap_2(), |builder, dir| {
-        let mut button = Button::new(direction_button_id(dir))
-            .small()
-            .label(direction_label(dir, language));
-        if dir == direction {
-            button = button.primary();
-        } else {
-            button = button.ghost();
-        }
-        builder.child(button.on_click({
-            let handle = form.clone();
-            let selected_direction = dir;
-            move |_, _, cx| {
-                handle.update(cx, |form, cx| {
-                    form.direction = selected_direction;
+    let username_ready = !username_value.trim().is_empty();
+    let auth_ready = match auth_choice {
+        AuthChoice::Password => username_ready && !password_value.trim().is_empty(),
+        AuthChoice::SshKey => username_ready && !private_key_value.trim().is_empty(),
+    };
+
+    let ready_to_submit = !name_value.trim().is_empty()
+        && !host_value.trim().is_empty()
+        && !base_path_value.trim().is_empty()
+        && rules_ready
+        && auth_ready;
+
+    let rules_list = rule_inputs.iter().enumerate().fold(
+        div().v_flex().gap_3(),
+        |builder, (index, rule_input)| {
+            let local_input = rule_input.local.clone();
+            let remote_input = rule_input.remote.clone();
+            let remove_button = if rule_inputs.len() > 1 {
+                Some(
+                    Button::new(("remove_rule", index))
+                        .ghost()
+                        .icon(Icon::new(IconName::Delete).small())
+                        .on_click({
+                            let handle = form.clone();
+                            move |_, _, cx| {
+                                handle.update(cx, |form, cx| {
+                                    if index < form.rules.len() {
+                                        form.rules.remove(index);
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        }),
+                )
+            } else {
+                None
+            };
+
+            let direction_selector = [
+                SyncDirection::Push,
+                SyncDirection::Pull,
+                SyncDirection::Bidirectional,
+            ]
+            .into_iter()
+            .fold(div().h_flex().gap_2(), |dir_builder, dir| {
+                let button_id = match dir {
+                    SyncDirection::Push => ("rule_dir_push", index),
+                    SyncDirection::Pull => ("rule_dir_pull", index),
+                    SyncDirection::Bidirectional => ("rule_dir_bidi", index),
+                };
+                let mut button = Button::new(button_id)
+                    .small()
+                    .label(direction_label(dir, language));
+                if dir == rule_input.direction {
+                    button = button.primary();
+                } else {
+                    button = button.ghost();
+                }
+                dir_builder.child(button.on_click({
+                    let handle = form.clone();
+                    move |_, _, cx| {
+                        handle.update(cx, |form, cx| {
+                            if let Some(rule) = form.rules.get_mut(index) {
+                                rule.direction = dir;
+                                cx.notify();
+                            }
+                        });
+                    }
+                }))
+            });
+
+            builder.child(
+                div()
+                    .v_flex()
+                    .gap_2()
+                    .p_3()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().muted.opacity(0.1))
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(tr(
+                                                language,
+                                                "Local Path",
+                                                "本地路径",
+                                                "本地路徑",
+                                            )),
+                                    )
+                                    .child(TextInput::new(&local_input).small()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(tr(
+                                                language,
+                                                "Remote Path",
+                                                "远程路径",
+                                                "遠端路徑",
+                                            )),
+                                    )
+                                    .child(TextInput::new(&remote_input).small()),
+                            )
+                            .child(remove_button.unwrap_or_else(|| {
+                                Button::new(("noop_rule_remove", index))
+                                    .ghost()
+                                    .icon(Icon::new(IconName::Delete).small())
+                                    .disabled(true)
+                            })),
+                    )
+                    .child(direction_selector),
+            )
+        },
+    );
+
+    let add_rule_button = Button::new("add_rule")
+        .ghost()
+        .icon(Icon::new(IconName::Plus).small())
+        .label(tr(language, "Add Rule", "新增规则", "新增規則"))
+        .on_click({
+            let form_entity = form.clone();
+            move |_, window, cx| {
+                form_entity.update(cx, |form, cx| {
+                    form.add_rule(window, cx, "./path", "/remote", SyncDirection::Push);
                     cx.notify();
                 });
             }
-        }))
-    });
+        });
+
+    let auth_selector = [AuthChoice::Password, AuthChoice::SshKey]
+        .into_iter()
+        .enumerate()
+        .fold(div().h_flex().gap_2(), |builder, (idx, choice)| {
+            let label = match choice {
+                AuthChoice::Password => tr(language, "Password", "密码", "密碼"),
+                AuthChoice::SshKey => tr(language, "SSH Key", "密钥", "SSH 金鑰"),
+            };
+            let mut button = Button::new(("auth_choice", idx)).label(label);
+            if choice == auth_choice {
+                button = button.primary();
+            } else {
+                button = button.ghost();
+            }
+            builder.child(button.on_click({
+                let handle = form.clone();
+                move |_, _, cx| {
+                    handle.update(cx, |form, cx| {
+                        form.auth_choice = choice;
+                        cx.notify();
+                    });
+                }
+            }))
+        });
+
+    let auth_fields = match auth_choice {
+        AuthChoice::Password => div()
+            .v_flex()
+            .gap_3()
+            .child(settings_row(
+                tr(language, "Username", "用户名", "使用者名稱"),
+                tr(
+                    language,
+                    "Account used for SSH/SFTP authentication.",
+                    "用于 SSH/SFTP 认证的账户。",
+                    "用於 SSH/SFTP 驗證的帳號。",
+                ),
+                TextInput::new(&username_input).small(),
+                cx,
+            ))
+            .child(settings_row(
+                tr(language, "Password", "密码", "密碼"),
+                tr(
+                    language,
+                    "Stored securely in the system keychain.",
+                    "安全存储在系统钥匙串中。",
+                    "安全儲存在系統鑰匙圈中。",
+                ),
+                TextInput::new(&password_input).mask_toggle().small(),
+                cx,
+            )),
+        AuthChoice::SshKey => div()
+            .v_flex()
+            .gap_3()
+            .child(settings_row(
+                tr(language, "Username", "用户名", "使用者名稱"),
+                tr(
+                    language,
+                    "Account used for SSH/SFTP authentication.",
+                    "用于 SSH/SFTP 认证的账户。",
+                    "用於 SSH/SFTP 驗證的帳號。",
+                ),
+                TextInput::new(&username_input).small(),
+                cx,
+            ))
+            .child(settings_row(
+                tr(language, "Private Key Path", "私钥路径", "私鑰路徑"),
+                tr(
+                    language,
+                    "Path to the private key file.",
+                    "私钥文件的路径。",
+                    "私鑰檔案路徑。",
+                ),
+                TextInput::new(&private_key_input).small(),
+                cx,
+            ))
+            .child(settings_row(
+                tr(
+                    language,
+                    "Passphrase (optional)",
+                    "密钥口令（可选）",
+                    "金鑰密碼（可選）",
+                ),
+                tr(
+                    language,
+                    "Leave empty if the key has no passphrase.",
+                    "如果没有口令可留空。",
+                    "若沒有口令可留白。",
+                ),
+                TextInput::new(&passphrase_input).mask_toggle().small(),
+                cx,
+            )),
+    };
 
     let cancel_handle = state_handle.clone();
     let cancel_button = Button::new("cancel_target_creation")
@@ -1379,28 +1704,6 @@ fn render_target_form_panel(
                     cx,
                 ))
                 .child(settings_row(
-                    tr(language, "Username", "用户名", "使用者名稱"),
-                    tr(
-                        language,
-                        "Account used for SSH/SFTP authentication.",
-                        "用于 SSH/SFTP 认证的账户。",
-                        "用於 SSH/SFTP 驗證的帳號。",
-                    ),
-                    TextInput::new(&username_input).small(),
-                    cx,
-                ))
-                .child(settings_row(
-                    tr(language, "Password", "密码", "密碼"),
-                    tr(
-                        language,
-                        "Stored locally for automatic authentication.",
-                        "本地保存用于自动认证。",
-                        "本地儲存用於自動驗證。",
-                    ),
-                    TextInput::new(&password_input).mask_toggle().small(),
-                    cx,
-                ))
-                .child(settings_row(
                     tr(language, "Remote base path", "远程根路径", "遠端根路徑"),
                     tr(
                         language,
@@ -1411,39 +1714,20 @@ fn render_target_form_panel(
                     TextInput::new(&base_path_input).small(),
                     cx,
                 ))
-                .child(settings_row(
-                    tr(language, "Local path", "本地路径", "本地路徑"),
-                    tr(
-                        language,
-                        "Workspace folder to watch and sync.",
-                        "需要同步的本地工作目录。",
-                        "需要同步的本地工作目錄。",
-                    ),
-                    TextInput::new(&local_path_input).small(),
-                    cx,
-                ))
-                .child(settings_row(
-                    tr(language, "Remote path", "远程路径", "遠端路徑"),
-                    tr(
-                        language,
-                        "Destination relative to the base path.",
-                        "相对于根路径的目标目录。",
-                        "相對於根路徑的目標目錄。",
-                    ),
-                    TextInput::new(&remote_path_input).small(),
-                    cx,
-                ))
-                .child(settings_row(
-                    tr(language, "Direction", "同步方向", "同步方向"),
-                    tr(
-                        language,
-                        "Choose how files should flow.",
-                        "选择文件传输方向。",
-                        "選擇檔案傳輸方向。",
-                    ),
-                    direction_buttons,
-                    cx,
-                ))
+                .child(
+                    GroupBox::new()
+                        .title(tr(language, "Sync rules", "同步规则", "同步規則"))
+                        .fill()
+                        .child(rules_list)
+                        .child(add_rule_button),
+                )
+                .child(
+                    GroupBox::new()
+                        .title(tr(language, "Authentication", "认证方式", "認證方式"))
+                        .fill()
+                        .child(auth_selector)
+                        .child(auth_fields),
+                )
                 .child(
                     div()
                         .h_flex()
@@ -1482,202 +1766,6 @@ fn render_connection_status_tag(status: Option<&ConnectionTestState>, language: 
     }
 }
 
-struct TargetFormView {
-    name: Entity<InputState>,
-    host: Entity<InputState>,
-    username: Entity<InputState>,
-    base_path: Entity<InputState>,
-    local_path: Entity<InputState>,
-    remote_path: Entity<InputState>,
-    password: Entity<InputState>,
-    direction: SyncDirection,
-    loaded_from: Option<TargetId>,
-}
-
-impl TargetFormView {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self {
-            name: Self::spawn_input(window, cx, "Production", false),
-            host: Self::spawn_input(window, cx, "prod.example.com:22", false),
-            username: Self::spawn_input(window, cx, "deploy", false),
-            base_path: Self::spawn_input(window, cx, "/srv/www", false),
-            local_path: Self::spawn_input(window, cx, "./apps/web", false),
-            remote_path: Self::spawn_input(window, cx, "/web", false),
-            password: Self::spawn_input(window, cx, "••••••", true),
-            direction: SyncDirection::Push,
-            loaded_from: None,
-        }
-    }
-
-    fn spawn_input(
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        placeholder: &str,
-        masked: bool,
-    ) -> Entity<InputState> {
-        let placeholder_text = placeholder.to_string();
-        cx.new(|cx| {
-            let mut state = InputState::new(window, cx);
-            state.set_placeholder(placeholder_text.clone(), window, cx);
-            if masked {
-                state.set_masked(true, window, cx);
-            }
-            state
-        })
-    }
-
-    fn ensure_mode(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        mode: TargetFormMode,
-        preset: Option<&RemoteTarget>,
-    ) {
-        match mode {
-            TargetFormMode::Create => {
-                if self.loaded_from.is_some() {
-                    self.reset(window, cx);
-                }
-            }
-            TargetFormMode::Edit(target_id) => {
-                if self.loaded_from != Some(target_id) {
-                    if let Some(target) = preset {
-                        self.prefill(window, cx, target);
-                    } else {
-                        self.reset(window, cx);
-                        self.loaded_from = Some(target_id);
-                    }
-                }
-            }
-        }
-    }
-
-    fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_value(&self.name, "", window, cx);
-        self.set_value(&self.host, "", window, cx);
-        self.set_value(&self.username, "", window, cx);
-        self.set_value(&self.base_path, "", window, cx);
-        self.set_value(&self.local_path, "", window, cx);
-        self.set_value(&self.remote_path, "", window, cx);
-        self.set_value(&self.password, "", window, cx);
-        self.direction = SyncDirection::Push;
-        self.loaded_from = None;
-    }
-
-    fn prefill(&mut self, window: &mut Window, cx: &mut Context<Self>, target: &RemoteTarget) {
-        self.set_value(&self.name, &target.name, window, cx);
-        self.set_value(&self.host, &target.host, window, cx);
-        self.set_value(&self.username, &target.username, window, cx);
-        self.set_value(
-            &self.base_path,
-            target.base_path.to_str().unwrap_or_default(),
-            window,
-            cx,
-        );
-        if let Some(rule) = target.rules.first() {
-            self.set_value(
-                &self.local_path,
-                rule.local.to_str().unwrap_or_default(),
-                window,
-                cx,
-            );
-            self.set_value(
-                &self.remote_path,
-                rule.remote.to_str().unwrap_or_default(),
-                window,
-                cx,
-            );
-            self.direction = rule.direction;
-        } else {
-            self.set_value(&self.local_path, "", window, cx);
-            self.set_value(&self.remote_path, "", window, cx);
-            self.direction = SyncDirection::Push;
-        }
-        self.set_value(&self.password, &target.password, window, cx);
-        self.loaded_from = Some(target.id);
-    }
-
-    fn set_value(
-        &self,
-        input: &Entity<InputState>,
-        value: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let text = value.to_string();
-        let _ = input.update(cx, |state, cx| {
-            state.set_value(text.clone(), window, cx);
-        });
-    }
-
-    fn build_target(&self, next_id: TargetId, cx: &mut Context<Self>) -> Option<RemoteTarget> {
-        let draft = TargetDraft {
-            name: self.read(&self.name, cx),
-            host: self.read(&self.host, cx),
-            username: self.read(&self.username, cx),
-            base_path: self.read(&self.base_path, cx),
-            local_path: self.read(&self.local_path, cx),
-            remote_path: self.read(&self.remote_path, cx),
-            password: self.read(&self.password, cx),
-            direction: self.direction,
-        };
-        draft.into_remote_target(next_id)
-    }
-
-    fn read(&self, input: &Entity<InputState>, cx: &mut Context<Self>) -> String {
-        input.read(cx).text().to_string()
-    }
-}
-
-struct TargetDraft {
-    name: String,
-    host: String,
-    username: String,
-    base_path: String,
-    local_path: String,
-    remote_path: String,
-    password: String,
-    direction: SyncDirection,
-}
-
-impl TargetDraft {
-    fn is_valid(&self) -> bool {
-        !self.name.trim().is_empty()
-            && !self.host.trim().is_empty()
-            && !self.username.trim().is_empty()
-            && !self.base_path.trim().is_empty()
-            && !self.local_path.trim().is_empty()
-            && !self.remote_path.trim().is_empty()
-            && !self.password.trim().is_empty()
-    }
-
-    fn into_remote_target(self, id: TargetId) -> Option<RemoteTarget> {
-        if !self.is_valid() {
-            return None;
-        }
-        Some(RemoteTarget {
-            id,
-            name: self.name.trim().to_string(),
-            host: self.host.trim().to_string(),
-            username: self.username.trim().to_string(),
-            base_path: PathBuf::from(self.base_path.trim()),
-            rules: vec![SyncRule {
-                local: PathBuf::from(self.local_path.trim()),
-                remote: PathBuf::from(self.remote_path.trim()),
-                direction: self.direction,
-            }],
-            password: self.password.trim().to_string(),
-        })
-    }
-}
-
-fn direction_button_id(direction: SyncDirection) -> &'static str {
-    match direction {
-        SyncDirection::Push => "direction_push",
-        SyncDirection::Pull => "direction_pull",
-        SyncDirection::Bidirectional => "direction_bidi",
-    }
-}
 
 fn render_session_card(
     session: &SyncSession,
@@ -2204,5 +2292,668 @@ fn tr(
         Language::English => en,
         Language::SimplifiedChinese => zh_hans,
         Language::TraditionalChinese => zh_hant,
+    }
+}
+
+fn plan_in_progress(state: &AppState, target_id: TargetId) -> bool {
+    state
+        .task_progress
+        .get(&target_id)
+        .map(|progress| matches!(progress.kind, TaskKind::Planning))
+        .unwrap_or(false)
+}
+
+fn schedule_plan_for_target(
+    state_handle: &Entity<AppState>,
+    target: RemoteTarget,
+    log_message: Option<String>,
+    cx: &mut Context<AppView>,
+) {
+    if state_handle
+        .read(cx)
+        .task_progress
+        .get(&target.id)
+        .map(|progress| matches!(progress.kind, TaskKind::Planning))
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let total_rules = target.rules.len().max(1);
+    let target_name = target.name.clone();
+    let target_id = target.id;
+
+    state_handle.update(cx, |state, cx| {
+        if let Some(message) = log_message.clone() {
+            state.log_event(LogLevel::Info, message);
+        }
+
+        let mut touched = false;
+        for session in state
+            .sessions
+            .iter_mut()
+            .filter(|session| session.target_id == target_id)
+        {
+            session.status = SyncStatus::Planning;
+            session.last_run = Some(SystemTime::now());
+            touched = true;
+        }
+
+        if !touched {
+            let id = state.next_session_id();
+            state.sessions.push(SyncSession {
+                id,
+                target_id,
+                status: SyncStatus::Planning,
+                last_run: Some(SystemTime::now()),
+                pending_actions: 0,
+            });
+        }
+
+        state.set_task_progress(
+            target_id,
+            TaskProgress::new(TaskKind::Planning, 0, total_rules),
+        );
+        cx.notify();
+    });
+
+    let receiver = task_queue::submit_plan(target.clone());
+    let handle = state_handle.clone();
+    {
+        let app: &mut App = cx;
+        app.spawn(async move |cx| {
+            while let Ok(event) = receiver.recv().await {
+                match event {
+                    TaskEvent::Progress { completed, total } => {
+                        let _ = handle.update(cx, |state, cx| {
+                            state.set_task_progress(
+                                target_id,
+                                TaskProgress::new(TaskKind::Planning, completed, total),
+                            );
+                            cx.notify();
+                        });
+                    }
+                    TaskEvent::Finished(result) => {
+                        let _ = handle.update(cx, |state, cx| {
+                            state.clear_task_progress(target_id);
+                            cx.notify();
+                        });
+                        match result {
+                            Ok(plan) => {
+                                let _ = handle.update(cx, |state, cx| {
+                                    state.apply_planned_jobs(target_id, plan);
+                                    let pending: usize = state
+                                        .jobs
+                                        .iter()
+                                        .filter(|job| job.target_id == target_id)
+                                        .map(|job| job.pending_actions())
+                                        .sum();
+                                    state.log_event(
+                                        LogLevel::Info,
+                                        format!(
+                                            "Sync plan ready for {} ({} actions)",
+                                            target_name, pending
+                                        ),
+                                    );
+                                    cx.notify();
+                                });
+                            }
+                            Err(err) => {
+                                let _ = handle.update(cx, |state, cx| {
+                                    state.log_event(
+                                        LogLevel::Error,
+                                        format!(
+                                            "Failed to prepare sync plan for {}: {err}",
+                                            target_name
+                                        ),
+                                    );
+                                    cx.notify();
+                                });
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            Ok::<_, Error>(())
+        })
+        .detach();
+}
+
+}
+
+fn destructive_counts(jobs: &[SyncJob]) -> (usize, usize) {
+    let mut delete_local = 0;
+    let mut delete_remote = 0;
+    for job in jobs {
+        for action in &job.plan.actions {
+            match action {
+                SyncAction::DeleteLocal { .. } => delete_local += 1,
+                SyncAction::DeleteRemote { .. } => delete_remote += 1,
+                _ => {}
+            }
+        }
+    }
+    (delete_local, delete_remote)
+}
+
+fn run_execute_jobs(
+    app: &mut App,
+    state_handle: &Entity<AppState>,
+    target: RemoteTarget,
+    jobs: Vec<SyncJob>,
+    settings: AppSettings,
+) {
+    let exec_receiver = task_queue::submit_execute(target.clone(), jobs, settings.clone());
+    let handle = state_handle.clone();
+    app.spawn({
+        let target_snapshot = target.clone();
+        async move |cx| {
+            loop {
+                match exec_receiver.recv().await {
+                    Ok(TaskEvent::Progress { completed, total }) => {
+                        let _ = handle.update(cx, |state, cx| {
+                            state.set_task_progress(
+                                target_snapshot.id,
+                                TaskProgress::new(TaskKind::Executing, completed, total),
+                            );
+                            cx.notify();
+                        });
+                        continue;
+                    }
+                    Ok(TaskEvent::Finished(Ok(summary))) => {
+                        let _ = handle.update(cx, |state, cx| {
+                            if summary.failures.is_empty() {
+                                state.log_event(
+                                    LogLevel::Info,
+                                    format!(
+                                        "Sync completed for {} ({} actions, {} conflicts)",
+                                        target_snapshot.name, summary.applied, summary.skipped
+                                    ),
+                                );
+                                for session in state
+                                    .sessions
+                                    .iter_mut()
+                                    .filter(|session| session.target_id == target_snapshot.id)
+                                {
+                                    session.status = SyncStatus::Completed;
+                                    session.last_run = Some(SystemTime::now());
+                                }
+                            } else {
+                                let failure_count = summary.failures.len();
+                                let first_error = summary
+                                    .failures
+                                    .first()
+                                    .map(|(_, reason)| reason.clone())
+                                    .unwrap_or_else(|| "Unknown failure".into());
+                                state.log_event(
+                                    LogLevel::Error,
+                                    format!(
+                                        "Sync finished with {failure_count} failures for {}: {first_error}",
+                                        target_snapshot.name
+                                    ),
+                                );
+                                for session in state
+                                    .sessions
+                                    .iter_mut()
+                                    .filter(|session| session.target_id == target_snapshot.id)
+                                {
+                                    session.status =
+                                        SyncStatus::Failed { reason: first_error.clone() };
+                                    session.last_run = Some(SystemTime::now());
+                                }
+                            }
+                            cx.notify();
+                        });
+
+                        let follow_receiver =
+                            task_queue::submit_plan(target_snapshot.clone());
+                        loop {
+                            match follow_receiver.recv().await {
+                                Ok(TaskEvent::Progress { completed, total }) => {
+                                    let _ = handle.update(cx, |state, cx| {
+                                        state.set_task_progress(
+                                            target_snapshot.id,
+                                            TaskProgress::new(
+                                                TaskKind::Planning,
+                                                completed,
+                                                total,
+                                            ),
+                                        );
+                                        cx.notify();
+                                    });
+                                    continue;
+                                }
+                                Ok(TaskEvent::Finished(Ok(plan))) => {
+                                    let _ = handle.update(cx, |state, cx| {
+                                        state.apply_planned_jobs(target_snapshot.id, plan);
+                                        state.clear_task_progress(target_snapshot.id);
+                                        cx.notify();
+                                    });
+                                    break;
+                                }
+                                Ok(TaskEvent::Finished(Err(err))) => {
+                                    let _ = handle.update(cx, |state, cx| {
+                                        state.clear_task_progress(target_snapshot.id);
+                                        state.log_event(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "Failed to refresh plan after sync for {}: {err}",
+                                                target_snapshot.name
+                                            ),
+                                        );
+                                        cx.notify();
+                                    });
+                                    break;
+                                }
+                                Err(recv_err) => {
+                                    let _ = handle.update(cx, |state, cx| {
+                                        state.clear_task_progress(target_snapshot.id);
+                                        state.log_event(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "Failed to refresh plan after sync for {}: {recv_err}",
+                                                target_snapshot.name
+                                            ),
+                                        );
+                                        cx.notify();
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    Ok(TaskEvent::Finished(Err(err))) => {
+                        let message = err.to_string();
+                        let _ = handle.update(cx, |state, cx| {
+                            state.log_event(
+                                LogLevel::Error,
+                                format!("Sync failed for {}: {}", target_snapshot.name, message),
+                            );
+                            for session in state
+                                .sessions
+                                .iter_mut()
+                                .filter(|session| session.target_id == target_snapshot.id)
+                            {
+                                session.status =
+                                    SyncStatus::Failed { reason: message.clone() };
+                                session.last_run = Some(SystemTime::now());
+                            }
+                            cx.notify();
+                        });
+                        break;
+                    }
+                    Err(recv_err) => {
+                        let message = format!("task cancelled: {recv_err}");
+                        let _ = handle.update(cx, |state, cx| {
+                            state.log_event(
+                                LogLevel::Error,
+                                format!("Sync failed for {}: {}", target_snapshot.name, message),
+                            );
+                            for session in state
+                                .sessions
+                                .iter_mut()
+                                .filter(|session| session.target_id == target_snapshot.id)
+                            {
+                                session.status =
+                                    SyncStatus::Failed { reason: message.clone() };
+                                session.last_run = Some(SystemTime::now());
+                            }
+                            cx.notify();
+                        });
+                        break;
+                    }
+                }
+            }
+
+            Ok::<_, Error>(())
+        }
+    })
+    .detach();
+}
+
+fn run_connection_test(
+    state_handle: &Entity<AppState>,
+    target: RemoteTarget,
+    language: Language,
+    cx: &mut Context<AppView>,
+) {
+    let target_id = target.id;
+    state_handle.update(cx, |state, cx| {
+        state
+            .connection_tests
+            .insert(target_id, ConnectionTestState::InProgress);
+        cx.notify();
+    });
+
+    let handle = state_handle.clone();
+    {
+        let app: &mut App = cx;
+        app.spawn(async move |cx| {
+            let result = connection::test_connection(&target);
+            let status = match result {
+                Ok(_) => ConnectionTestState::Success(
+                    tr(language, "Connection OK", "连接成功", "連線成功").into(),
+                ),
+                Err(err) => ConnectionTestState::Failure(err.to_string()),
+            };
+            let _ = handle.update(cx, |state, cx| {
+                state.connection_tests.insert(target_id, status);
+                cx.notify();
+            });
+            Ok::<_, Error>(())
+        })
+        .detach();
+    }
+}
+#[derive(Clone)]
+struct RuleInputs {
+    local: Entity<InputState>,
+    remote: Entity<InputState>,
+    direction: SyncDirection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthChoice {
+    Password,
+    SshKey,
+}
+
+struct TargetFormView {
+    name: Entity<InputState>,
+    host: Entity<InputState>,
+    username: Entity<InputState>,
+    base_path: Entity<InputState>,
+    password: Entity<InputState>,
+    private_key: Entity<InputState>,
+    passphrase: Entity<InputState>,
+    auth_choice: AuthChoice,
+    rules: Vec<RuleInputs>,
+    loaded_from: Option<TargetId>,
+}
+
+impl TargetFormView {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut view = Self {
+            name: Self::spawn_input(window, cx, "Production", false),
+            host: Self::spawn_input(window, cx, "prod.example.com:22", false),
+            username: Self::spawn_input(window, cx, "deploy", false),
+            base_path: Self::spawn_input(window, cx, "/srv/www", false),
+            password: Self::spawn_input(window, cx, "••••••", true),
+            private_key: Self::spawn_input(window, cx, "~/.ssh/id_ed25519", false),
+            passphrase: Self::spawn_input(window, cx, "••••••", true),
+            auth_choice: AuthChoice::Password,
+            rules: Vec::new(),
+            loaded_from: None,
+        };
+        view.add_rule(window, cx, "./apps/web", "/web", SyncDirection::Push);
+        view
+    }
+
+    fn add_rule(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        local_placeholder: &str,
+        remote_placeholder: &str,
+        direction: SyncDirection,
+    ) {
+        let local = Self::spawn_input(window, cx, local_placeholder, false);
+        let remote = Self::spawn_input(window, cx, remote_placeholder, false);
+        self.rules.push(RuleInputs {
+            local,
+            remote,
+            direction,
+        });
+    }
+
+    fn spawn_input(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        placeholder: &str,
+        masked: bool,
+    ) -> Entity<InputState> {
+        let placeholder_text = placeholder.to_string();
+        cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_placeholder(placeholder_text.clone(), window, cx);
+            if masked {
+                state.set_masked(true, window, cx);
+            }
+            state
+        })
+    }
+
+    fn ensure_mode(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        mode: TargetFormMode,
+        preset: Option<&RemoteTarget>,
+    ) {
+        match mode {
+            TargetFormMode::Create => {
+                if self.loaded_from.is_some() {
+                    self.reset(window, cx);
+                }
+            }
+            TargetFormMode::Edit(target_id) => {
+                if self.loaded_from != Some(target_id) {
+                    if let Some(target) = preset {
+                        self.prefill(window, cx, target);
+                    } else {
+                        self.reset(window, cx);
+                        self.loaded_from = Some(target_id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_value(&self.name, "", window, cx);
+        self.set_value(&self.host, "", window, cx);
+        self.set_value(&self.username, "", window, cx);
+        self.set_value(&self.base_path, "", window, cx);
+        self.set_value(&self.password, "", window, cx);
+        self.set_value(&self.private_key, "", window, cx);
+        self.set_value(&self.passphrase, "", window, cx);
+        self.auth_choice = AuthChoice::Password;
+        self.rules.clear();
+        self.add_rule(window, cx, "./apps/web", "/web", SyncDirection::Push);
+        self.loaded_from = None;
+    }
+
+    fn prefill(&mut self, window: &mut Window, cx: &mut Context<Self>, target: &RemoteTarget) {
+        self.set_value(&self.name, &target.name, window, cx);
+        self.set_value(&self.host, &target.host, window, cx);
+        self.set_value(&self.username, &target.username, window, cx);
+        self.set_value(
+            &self.base_path,
+            target.base_path.to_str().unwrap_or_default(),
+            window,
+            cx,
+        );
+
+        self.rules.clear();
+        for rule in &target.rules {
+            self.add_rule(
+                window,
+                cx,
+                rule.local.to_str().unwrap_or_default(),
+                rule.remote.to_str().unwrap_or_default(),
+                rule.direction,
+            );
+        }
+        if self.rules.is_empty() {
+            self.add_rule(window, cx, "./apps/web", "/web", SyncDirection::Push);
+        }
+
+        match &target.auth {
+            AuthMethod::Password { secret, .. } => {
+                self.auth_choice = AuthChoice::Password;
+                self.set_value(&self.password, secret, window, cx);
+                self.set_value(&self.private_key, "", window, cx);
+                self.set_value(&self.passphrase, "", window, cx);
+            }
+            AuthMethod::SshKey {
+                private_key,
+                passphrase,
+                ..
+            } => {
+                self.auth_choice = AuthChoice::SshKey;
+                self.set_value(
+                    &self.private_key,
+                    private_key.to_str().unwrap_or_default(),
+                    window,
+                    cx,
+                );
+                self.set_value(
+                    &self.passphrase,
+                    passphrase.as_deref().unwrap_or_default(),
+                    window,
+                    cx,
+                );
+                self.set_value(&self.password, "", window, cx);
+            }
+        }
+        self.loaded_from = Some(target.id);
+    }
+
+    fn set_value(
+        &self,
+        input: &Entity<InputState>,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = value.to_string();
+        let _ = input.update(cx, |state, cx| {
+            state.set_value(text.clone(), window, cx);
+        });
+    }
+
+    fn build_target(&self, next_id: TargetId, cx: &mut Context<Self>) -> Option<RemoteTarget> {
+        let rules = self
+            .rules
+            .iter()
+            .map(|inputs| RuleDraft {
+                local: self.read(&inputs.local, cx),
+                remote: self.read(&inputs.remote, cx),
+                direction: inputs.direction,
+            })
+            .collect();
+
+        let draft = TargetDraft {
+            name: self.read(&self.name, cx),
+            host: self.read(&self.host, cx),
+            username: self.read(&self.username, cx),
+            base_path: self.read(&self.base_path, cx),
+            password: self.read(&self.password, cx),
+            private_key: self.read(&self.private_key, cx),
+            passphrase: self.read(&self.passphrase, cx),
+            auth_choice: self.auth_choice,
+            rules,
+        };
+        draft.into_remote_target(next_id)
+    }
+
+    fn read(&self, input: &Entity<InputState>, cx: &mut Context<Self>) -> String {
+        input.read(cx).text().to_string()
+    }
+}
+
+struct TargetDraft {
+    name: String,
+    host: String,
+    username: String,
+    base_path: String,
+    password: String,
+    private_key: String,
+    passphrase: String,
+    auth_choice: AuthChoice,
+    rules: Vec<RuleDraft>,
+}
+
+struct RuleDraft {
+    local: String,
+    remote: String,
+    direction: SyncDirection,
+}
+
+impl TargetDraft {
+    fn is_valid(&self) -> bool {
+        let base_valid = !self.name.trim().is_empty()
+            && !self.host.trim().is_empty()
+            && !self.username.trim().is_empty()
+            && !self.base_path.trim().is_empty()
+            && !self.rules.is_empty();
+        if !base_valid {
+            return false;
+        }
+
+        let mut local_paths = std::collections::HashSet::new();
+        let mut remote_paths = std::collections::HashSet::new();
+        for rule in &self.rules {
+            let local = rule.local.trim();
+            let remote = rule.remote.trim();
+            if local.is_empty() || remote.is_empty() {
+                return false;
+            }
+            if !local_paths.insert(local.to_string()) || !remote_paths.insert(remote.to_string()) {
+                return false;
+            }
+        }
+
+        match self.auth_choice {
+            AuthChoice::Password => !self.password.trim().is_empty(),
+            AuthChoice::SshKey => !self.private_key.trim().is_empty(),
+        }
+    }
+
+    fn into_remote_target(self, id: TargetId) -> Option<RemoteTarget> {
+        if !self.is_valid() {
+            return None;
+        }
+
+        let auth = match self.auth_choice {
+            AuthChoice::Password => AuthMethod::Password {
+                secret: self.password.trim().to_string(),
+                stored: false,
+            },
+            AuthChoice::SshKey => AuthMethod::SshKey {
+                private_key: PathBuf::from(self.private_key.trim()),
+                passphrase: {
+                    let trimmed = self.passphrase.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                },
+                passphrase_stored: false,
+            },
+        };
+
+        let rules = self
+            .rules
+            .into_iter()
+            .map(|rule| SyncRule {
+                local: PathBuf::from(rule.local.trim()),
+                remote: PathBuf::from(rule.remote.trim()),
+                direction: rule.direction,
+            })
+            .collect();
+
+        Some(RemoteTarget {
+            id,
+            name: self.name.trim().to_string(),
+            host: self.host.trim().to_string(),
+            username: self.username.trim().to_string(),
+            base_path: PathBuf::from(self.base_path.trim()),
+            rules,
+            auth,
+        })
     }
 }
