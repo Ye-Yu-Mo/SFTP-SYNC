@@ -1,0 +1,604 @@
+---
+title: "List | GPUI Component"
+source: "https://longbridge.github.io/gpui-component/docs/components/list"
+author:
+published:
+created: 2025-12-05
+description: "A flexible list component that displays a series of items with support for sections, search, selection, and infinite scrolling."
+tags:
+  - "clippings"
+---
+## List
+
+A powerful List component that provides a virtualized, searchable list interface with support for sections, headers, footers, selection states, and infinite scrolling. The component is built on a delegate pattern that allows for flexible data management and custom item rendering.
+
+## Import
+
+```rust
+rustuse gpui_component::list::{List, ListState, ListDelegate, ListItem, ListEvent, ListSeparatorItem};
+
+use gpui_component::IndexPath;
+```
+
+## Usage
+
+### Basic List
+
+To create a list, you need to implement the `ListDelegate` trait for your data:
+
+```rust
+ruststruct MyListDelegate {
+
+    items: Vec<String>,
+
+    selected_index: Option<IndexPath>,
+
+}
+
+impl ListDelegate for MyListDelegate {
+
+    type Item = ListItem;
+
+    fn items_count(&self, _section: usize, _cx: &App) -> usize {
+
+        self.items.len()
+
+    }
+
+    fn render_item(
+
+        &mut self,
+
+        ix: IndexPath,
+
+        _window: &mut Window,
+
+        _cx: &mut Context<TableState<Self>>,
+
+    ) -> Option<Self::Item> {
+
+        self.items.get(ix.row).map(|item| {
+
+            ListItem::new(ix)
+
+                .child(Label::new(item.clone()))
+
+                .selected(Some(ix) == self.selected_index)
+
+        })
+
+    }
+
+    fn set_selected_index(
+
+        &mut self,
+
+        ix: Option<IndexPath>,
+
+        _window: &mut Window,
+
+        cx: &mut Context<ListState<Self>>,
+
+    ) {
+
+        self.selected_index = ix;
+
+        cx.notify();
+
+    }
+
+}
+
+// Create the list
+
+let delegate = MyListDelegate {
+
+    items: vec!["Item 1".into(), "Item 2".into(), "Item 3".into()],
+
+    selected_index: None,
+
+};
+
+/// Create a list state.
+
+let state = cx.new(|cx| ListState::new(delegate, window, cx));
+```
+
+Now use \[List\] to render list:
+
+```rust
+rsdiv().child(List::new(&state))
+```
+
+### List with Sections
+
+```rust
+rustimpl ListDelegate for MyListDelegate {
+
+    type Item = ListItem;
+
+    fn sections_count(&self, _cx: &App) -> usize {
+
+        3 // Number of sections
+
+    }
+
+    fn items_count(&self, section: usize, _cx: &App) -> usize {
+
+        match section {
+
+            0 => 5,
+
+            1 => 3,
+
+            2 => 7,
+
+            _ => 0,
+
+        }
+
+    }
+
+    fn render_section_header(
+
+        &mut self,
+
+        section: usize,
+
+        _window: &mut Window,
+
+        cx: &mut Context<TableState<Self>>,
+
+    ) -> Option<impl IntoElement> {
+
+        let title = match section {
+
+            0 => "Section 1",
+
+            1 => "Section 2",
+
+            2 => "Section 3",
+
+            _ => return None,
+
+        };
+
+        Some(
+
+            h_flex()
+
+                .px_2()
+
+                .py_1()
+
+                .gap_2()
+
+                .text_sm()
+
+                .text_color(cx.theme().muted_foreground)
+
+                .child(Icon::new(IconName::Folder))
+
+                .child(title)
+
+        )
+
+    }
+
+    fn render_section_footer(
+
+        &mut self,
+
+        section: usize,
+
+        _window: &mut Window,
+
+        cx: &mut Context<TableState<Self>>,
+
+    ) -> Option<impl IntoElement> {
+
+        Some(
+
+            div()
+
+                .px_2()
+
+                .py_1()
+
+                .text_xs()
+
+                .text_color(cx.theme().muted_foreground)
+
+                .child(format!("End of section {}", section + 1))
+
+        )
+
+    }
+
+}
+```
+
+### List Items with Icons and Actions
+
+```rust
+rustfn render_item(
+
+    &mut self,
+
+    ix: IndexPath,
+
+    _window: &mut Window,
+
+    cx: &mut Context<TableState<Self>>,
+
+) -> Option<Self::Item> {
+
+    self.items.get(ix.row).map(|item| {
+
+        ListItem::new(ix)
+
+            .child(
+
+                h_flex()
+
+                    .items_center()
+
+                    .gap_2()
+
+                    .child(Icon::new(IconName::File))
+
+                    .child(Label::new(item.title.clone()))
+
+            )
+
+            .suffix(|_, _| {
+
+                Button::new("action")
+
+                    .ghost()
+
+                    .small()
+
+                    .icon(IconName::MoreHorizontal)
+
+            })
+
+            .selected(Some(ix) == self.selected_index)
+
+            .on_click(cx.listener(move |this, _, window, cx| {
+
+                this.delegate_mut().select_item(ix, window, cx);
+
+            }))
+
+    })
+
+}
+```
+
+The list automatically includes a search input by default. Implement `perform_search` to handle queries:
+
+And you should use `searchable(true)` when creating the `ListState` to show search input.
+
+```rust
+rustimpl ListDelegate for MyListDelegate {
+
+    fn perform_search(
+
+        &mut self,
+
+        query: &str,
+
+        _window: &mut Window,
+
+        _cx: &mut Context<ListState<Self>>,
+
+    ) -> Task<()> {
+
+        // Filter items based on query
+
+        self.filtered_items = self.all_items
+
+            .iter()
+
+            .filter(|item| item.to_lowercase().contains(&query.to_lowercase()))
+
+            .cloned()
+
+            .collect();
+
+        Task::ready(())
+
+    }
+
+}
+
+let state = cx.new(|cx| ListState::new(delegate, window, cx).searchable(true));
+
+List::new(&state)
+```
+```rust
+rustimpl ListDelegate for MyListDelegate {
+
+    fn loading(&self, _cx: &App) -> bool {
+
+        self.is_loading
+
+    }
+
+    fn render_loading(
+
+        &mut self,
+
+        _window: &mut Window,
+
+        _cx: &mut Context<TableState<Self>>,
+
+    ) -> impl IntoElement {
+
+        // Custom loading view
+
+        v_flex()
+
+            .justify_center()
+
+            .items_center()
+
+            .py_4()
+
+            .child(Skeleton::new().h_4().w_full())
+
+            .child(Skeleton::new().h_4().w_3_4())
+
+    }
+
+}
+```
+
+### Infinite Scrolling
+
+```rust
+rustimpl ListDelegate for MyListDelegate {
+
+    fn is_eof(&self, _cx: &App) -> bool {
+
+        !self.has_more_data
+
+    }
+
+    fn load_more_threshold(&self) -> usize {
+
+        20 // Trigger when 20 items from bottom
+
+    }
+
+    fn load_more(&mut self, window: &mut Window, cx: &mut Context<ListState<Self>>) {
+
+        if self.is_loading {
+
+            return;
+
+        }
+
+        self.is_loading = true;
+
+        cx.spawn_in(window, async move |view, window| {
+
+            // Simulate API call
+
+            Timer::after(Duration::from_secs(1)).await;
+
+            view.update_in(window, |view, _, cx| {
+
+                // Add more items
+
+                view.delegate_mut().load_more_items();
+
+                view.delegate_mut().is_loading = false;
+
+                cx.notify();
+
+            });
+
+        }).detach();
+
+    }
+
+}
+```
+
+### List Events
+
+### Different Item Styles
+
+```rust
+rust// Basic item with hover effect
+
+ListItem::new(ix)
+
+    .child(Label::new("Basic Item"))
+
+    .selected(is_selected)
+
+// Item with check icon
+
+ListItem::new(ix)
+
+    .child(Label::new("Checkable Item"))
+
+    .check_icon(IconName::Check)
+
+    .confirmed(is_confirmed)
+
+// Disabled item
+
+ListItem::new(ix)
+
+    .child(Label::new("Disabled Item"))
+
+    .disabled(true)
+
+// Separator item
+
+ListSeparatorItem::new()
+
+    .child(
+
+        div()
+
+            .h_px()
+
+            .w_full()
+
+            .bg(cx.theme().border)
+
+    )
+```
+
+### Custom Empty State
+
+## Configuration Options
+
+### List Configuration
+
+```rust
+rustList::new(&state)
+
+    .max_h(px(400.))                    // Set maximum height
+
+    .scrollbar_visible(false)           // Hide scrollbar
+
+    .paddings(Edges::all(px(8.)))       // Set internal padding
+```
+
+### Scrolling Control
+
+```rust
+rust// Scroll to specific item
+
+state.update(cx, |state, cx| {
+
+    state.scroll_to_item(
+
+        IndexPath::new(0).section(1),  // Row 0 of section 1
+
+        ScrollStrategy::Center,
+
+        window,
+
+        cx,
+
+    );
+
+});
+
+// Scroll to selected item
+
+state.update(cx, |state, cx| {
+
+    state.scroll_to_selected_item(window, cx);
+
+});
+
+// Set selected index without scrolling
+
+state.update(cx, |state, cx| {
+
+    state.set_selected_index(Some(IndexPath::new(5)), window, cx);
+
+});
+```
+
+## Examples
+
+### File Browser List
+
+```rust
+ruststruct FileBrowserDelegate {
+
+    files: Vec<FileInfo>,
+
+    selected: Option<IndexPath>,
+
+}
+
+#[derive(Clone)]
+
+struct FileInfo {
+
+    name: String,
+
+    is_directory: bool,
+
+    size: Option<u64>,
+
+}
+
+impl ListDelegate for FileBrowserDelegate {
+
+    type Item = ListItem;
+
+    fn render_item(&mut self, ix: IndexPath, window: &mut Window, cx: &mut Context<TableState<Self>>) -> Option<Self::Item> {
+
+        self.files.get(ix.row).map(|file| {
+
+            let icon = if file.is_directory {
+
+                IconName::Folder
+
+            } else {
+
+                IconName::File
+
+            };
+
+            ListItem::new(ix)
+
+                .child(
+
+                    h_flex()
+
+                        .items_center()
+
+                        .justify_between()
+
+                        .w_full()
+
+                        .child(
+
+                            h_flex()
+
+                                .items_center()
+
+                                .gap_2()
+
+                                .child(Icon::new(icon))
+
+                                .child(Label::new(file.name.clone()))
+
+                        )
+
+                        .when_some(file.size, |this, size| {
+
+                            this.child(
+
+                                Label::new(format_size(size))
+
+                                    .text_sm()
+
+                                    .text_color(cx.theme().muted_foreground)
+
+                            )
+
+                        })
+
+                )
+
+                .selected(Some(ix) == self.selected)
+
+        })
+
+    }
+
+}
+```
